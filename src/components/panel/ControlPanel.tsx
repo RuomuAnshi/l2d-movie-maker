@@ -111,6 +111,9 @@ type Props = {
   onStopRecording: () => void;
   onSaveWebM: () => void;
   onConvertToMov: () => void;
+  onStartOfflineExport: () => void;
+  onStartSubtitleOnlyExport: () => void;
+  onStartLive2DOnlyExport: () => void;
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
@@ -252,6 +255,9 @@ export default function ControlPanel(props: Props) {
     onStopRecording,
     onSaveWebM,
     onConvertToMov,
+    onStartOfflineExport,
+    onStartSubtitleOnlyExport,
+    onStartLive2DOnlyExport,
     onExportSubtitlesSrt,
     onTakeScreenshot,
     onTakePartsScreenshots,
@@ -854,6 +860,9 @@ export default function ControlPanel(props: Props) {
                     onStopRecording={onStopRecording}
                     onSaveWebM={onSaveWebM}
                     onConvertToMov={onConvertToMov}
+                    onStartOfflineExport={onStartOfflineExport}
+                    onStartSubtitleOnlyExport={onStartSubtitleOnlyExport}
+                    onStartLive2DOnlyExport={onStartLive2DOnlyExport}
                     onExportSubtitlesSrt={onExportSubtitlesSrt}
                     onTakeScreenshot={onTakeScreenshot}
                     onTakePartsScreenshots={onTakePartsScreenshots}

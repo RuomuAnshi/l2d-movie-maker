@@ -176,9 +176,6 @@ export default function RecordingManager({
     stopPlayback();
   };
 
-  const saveWebM = async () => {};
-  const toMov = async () => {};
-
   const takeScreenshot = async () => {
     if (!canvasRef.current) return;
     try {
@@ -209,5 +206,5 @@ export default function RecordingManager({
     }
   };
 
-  return { recRef, start, stop, saveWebM, toMov, takeScreenshot, takePartsScreenshots };
+  return { recRef, start, stop, takeScreenshot, takePartsScreenshots };
 }

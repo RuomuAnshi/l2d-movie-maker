@@ -457,6 +457,13 @@ pub fn get_model_server_info() -> Result<ModelServerInfo, String> {
     let model_dir = exe_dir().join("model");
     let port = ensure_model_server_started()?;
 
+    // 首次启动时 models.json 可能尚未生成，先扫描一次，避免前端显示“未发现模型”
+    if !model_dir.join("models.json").exists() {
+        if let Err(error) = generate_models_json(&model_dir) {
+            eprintln!("自动生成 models.json 失败: {}", error);
+        }
+    }
+
     Ok(ModelServerInfo {
         base_url: format!("http://127.0.0.1:{}/model", port),
         models_dir: model_dir.to_string_lossy().into(),

@@ -70,7 +70,11 @@ export default function Timeline({
   const pps = typeof pixelsPerSec === "number" ? pixelsPerSec : internalPps;
   const setPps = (value: number) => {
     const next = Math.max(10, Math.min(800, Math.round(value)));
-    onChangePixelsPerSec ? onChangePixelsPerSec(next) : setInternalPps(next);
+    if (onChangePixelsPerSec) {
+      onChangePixelsPerSec(next);
+    } else {
+      setInternalPps(next);
+    }
   };
 
   const lengthSec = useMemo(

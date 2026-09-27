@@ -131,6 +131,7 @@ export async function runOfflineWebMExport(params: OfflineExportParams): Promise
       frameCount: totalFrames,
     };
   } finally {
-    try { await remove(frameDir, { recursive: true }); } catch {}
+    try { await remove(frameDir, { recursive: true }); } catch { /* 帧目录清理失败不阻断 */ }
+    try { await remove(outWebm); } catch { /* 临时导出文件清理失败不阻断 */ }
   }
 }

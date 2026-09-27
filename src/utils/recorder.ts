@@ -68,10 +68,10 @@ function createAudioManager(
             audio.play().catch(() => {});
             const stopTimerId = window.setTimeout(() => {
               playbackTimers.delete(stopTimerId);
-              try { audio.pause(); audio.currentTime = 0; } catch (e) {}
+              try { audio.pause(); audio.currentTime = 0; } catch { /* 忽略 */ }
             }, clip.duration * 1000);
             playbackTimers.add(stopTimerId);
-          } catch (e) {}
+          } catch { /* 忽略 */ }
         }, clip.start * 1000);
         playbackTimers.add(startTimerId);
       }
@@ -81,15 +81,15 @@ function createAudioManager(
   function stopAllAudio() {
     clearPlaybackTimers();
     audioElements.forEach(audio => {
-      try { audio.pause(); audio.currentTime = 0; } catch (e) {}
+      try { audio.pause(); audio.currentTime = 0; } catch { /* 忽略 */ }
     });
   }
 
   function cleanup() {
     clearPlaybackTimers();
-    try { cs?.stop(); } catch {}
+    try { cs?.stop(); } catch { /* 无音频源时忽略 */ }
     audioElements.forEach(audio => {
-      try { audio.pause(); audio.src = ''; } catch (e) {}
+      try { audio.pause(); audio.src = ''; } catch { /* 忽略 */ }
     });
     audioElements.clear();
   }
@@ -166,7 +166,7 @@ export function createVp9AlphaRecorder(
   function stop(): Promise<Blob> {
     return new Promise((resolve) => {
       if (!mr) return resolve(new Blob());
-      try { mr.requestData(); } catch {}
+      try { mr.requestData(); } catch { /* 已停止时忽略 */ }
       mr.onstop = () => {
         const blob = new Blob(chunks, { type: mr!.mimeType });
         cleanup();
@@ -178,7 +178,7 @@ export function createVp9AlphaRecorder(
 
   function cleanup() {
     audioManager?.cleanup();
-    try { ac?.close(); } catch {}
+    try { ac?.close(); } catch { /* 已关闭时忽略 */ }
     stream?.getTracks().forEach(t => t.stop());
     if (progressInterval) clearInterval(progressInterval);
     mr = null; ac = null; stream = null; audioManager = null;
@@ -305,7 +305,7 @@ export function createModelFrameRecorder(
   function stop(): Promise<Blob> {
     return new Promise((resolve) => {
       if (!mr) return resolve(new Blob());
-      try { mr.requestData(); } catch {}
+      try { mr.requestData(); } catch { /* 已停止时忽略 */ }
       mr.onstop = () => {
         const blob = new Blob(chunks, { type: mr!.mimeType });
         cleanup();
@@ -318,7 +318,7 @@ export function createModelFrameRecorder(
   function cleanup() {
     audioManager?.cleanup();
     if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-    try { ac?.close(); } catch {}
+    try { ac?.close(); } catch { /* 已关闭时忽略 */ }
     stream?.getTracks().forEach(t => t.stop());
     if (progressInterval) clearInterval(progressInterval);
     if (frameEl) { document.body.removeChild(frameEl); frameEl = null; }

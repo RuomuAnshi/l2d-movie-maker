@@ -10,7 +10,7 @@ export function normalizePath(p: string): string {
   p = p.replace(/^file:\/\//i, "");
   
   // 检查是否是 Windows 绝对路径
-  const isWindowsAbsolute = /^[a-z]:[\\\/]/i.test(p);
+  const isWindowsAbsolute = /^[a-z]:[\\/]/i.test(p);
   
   if (isWindowsAbsolute) {
     // Windows 绝对路径：保持反斜杠，只处理连续的反斜杠

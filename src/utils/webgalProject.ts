@@ -3,6 +3,7 @@ import { appLocalDataDir, dirname, join } from "@tauri-apps/api/path";
 import { open } from "@tauri-apps/plugin-dialog";
 import { exists, mkdir, readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { parseMotionDurationSeconds } from "./motionDuration";
+import { normalizeModelData } from "./modelData";
 import { normalizePath } from "./fs";
 import type { WebGALCommand, WebGALDialogueCommand } from "./webgalScript";
 
@@ -664,8 +665,8 @@ async function readMotionFileMapFromModel(modelAbsolutePath: string): Promise<Mo
 
     if (!firstPartPath) return {};
     const firstModelText = await externalReadTextFile(firstPartPath);
-    const firstModelData = JSON.parse(firstModelText) as { motions?: Record<string, Array<{ file?: string }>> };
-    const sourceMotions = firstModelData.motions ?? {};
+    const firstModelData = normalizeModelData(JSON.parse(firstModelText));
+    const sourceMotions = firstModelData.motions;
     const groups = summary.motions?.length ? summary.motions : Object.keys(sourceMotions);
 
     return Object.fromEntries(
@@ -676,8 +677,8 @@ async function readMotionFileMapFromModel(modelAbsolutePath: string): Promise<Mo
   }
 
   const text = await externalReadTextFile(modelAbsolutePath);
-  const modelData = JSON.parse(text) as { motions?: Record<string, Array<{ file?: string }>> };
-  const sourceMotions = modelData.motions ?? {};
+  const modelData = normalizeModelData(JSON.parse(text));
+  const sourceMotions = modelData.motions;
 
   return Object.fromEntries(
     Object.entries(sourceMotions)

@@ -18,7 +18,7 @@ import AlertModal from "./AlertModal";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { appCacheDir, BaseDirectory, join } from "@tauri-apps/api/path";
-import { writeFile } from "@tauri-apps/plugin-fs";
+import { remove, writeFile } from "@tauri-apps/plugin-fs";
 import { isVp9AlphaSupported } from "../utils/recorder";
 import { runOfflineWebMExport } from "../utils/offlineExporter";
 import {
@@ -40,7 +40,6 @@ type CharacterOption = { id: string; label: string };
 type CharacterTransform = { x: number; y: number; scaleX: number; scaleY: number; rotation: number };
 type CharacterTransformMode = "single-relative" | "composite-container";
 type TransformTarget = Pick<PIXI.Container, "position" | "scale" | "rotation" | "getBounds">;
-type BoundsTarget = Pick<Live2DModel, "width" | "height" | "position" | "scale" | "getBounds" | "getLocalBounds">;
 type RendererWithBackground = PIXI.Renderer & {
   backgroundColor: number;
   backgroundAlpha: number;
@@ -930,19 +929,6 @@ export default function Live2DView() {
     renderer.clearBeforeRender = false;
   };
 
-  const applyBoundsFromModelMetrics = (model: BoundsTarget) => {
-    const modelWidth = model.width * model.scale.x;
-    const modelHeight = model.height * model.scale.y;
-    const modelX = model.position.x - modelWidth / 2;
-    const modelY = model.position.y - modelHeight / 2;
-    setCustomRecordingBounds({
-      x: Math.max(0, modelX),
-      y: Math.max(0, modelY),
-      width: Math.max(100, Math.min(modelWidth, window.innerWidth)),
-      height: Math.max(100, Math.min(modelHeight, window.innerHeight)),
-    });
-  };
-
   const syncPlayheadUi = (nextPlayhead: number, ts: number, force: boolean = false) => {
     playheadRef.current = nextPlayhead;
 
@@ -1113,7 +1099,8 @@ export default function Live2DView() {
 
     const blobOnlyAudio = audioClips.filter(c => c.audioUrl && !c.audioPath && /^blob:/i.test(c.audioUrl));
     if (blobOnlyAudio.length > 0) {
-      showAlert("错误: 存在 blob 音频无法直接导出");
+      showAlert(`错误: 有 ${blobOnlyAudio.length} 条临时 blob 音频无法用于离线导出，请删除后从文件重新导入音频`);
+      return;
     }
 
     const hasValidBounds = customRecordingBounds && customRecordingBounds.width > 0 && customRecordingBounds.height > 0;
@@ -1242,7 +1229,6 @@ export default function Live2DView() {
       if (wasTickerStarted) app.ticker.start();
     }
   };
-  void startOfflineExport;
 
   const recordingManager = RecordingManager({
     canvasRef,
@@ -1282,9 +1268,13 @@ export default function Live2DView() {
     const name = `alpha-${Date.now()}.webm`;
     await writeFile(name, new Uint8Array(await blob.arrayBuffer()), { baseDir: BaseDirectory.AppCache });
     const abs = await join(await appCacheDir(), name);
-    const out = await save({ defaultPath: "export-4444.mov", filters: [{ name: "MOV", extensions: ["mov"] }] });
-    if (!out) return;
-    await invoke("vp9_to_prores4444", { inWebm: abs, outMov: out });
+    try {
+      const out = await save({ defaultPath: "export-4444.mov", filters: [{ name: "MOV", extensions: ["mov"] }] });
+      if (!out) return;
+      await invoke("vp9_to_prores4444", { inWebm: abs, outMov: out });
+    } finally {
+      try { await remove(abs); } catch { /* 临时转码文件清理失败可忽略 */ }
+    }
   };
 
   // ??WebGAL??????
@@ -1441,46 +1431,6 @@ export default function Live2DView() {
     }
   };
 
-
-  // ????????- ?? getBounds() ??????????
-  const resetToModelBounds = () => {
-    void resetToModelBounds;
-    if (!appRef.current) return;
-
-    if (modelRef.current) {
-      if (Array.isArray(modelRef.current)) {
-        // ???? - ??????getBounds
-        if (groupContainerRef.current) {
-          const b = groupContainerRef.current.getBounds();
-          setCustomRecordingBounds({
-            x: Math.max(0, b.x),
-            y: Math.max(0, b.y),
-            width: Math.max(100, Math.min(b.width, window.innerWidth)),
-            height: Math.max(100, Math.min(b.height, window.innerHeight)),
-          });
-        }
-      } else {
-        // ????- ?? getBounds() ????????
-        const model = modelRef.current;
-        try {
-          // ???? getBounds ????????
-          const b = model.getBounds() || model.getLocalBounds();
-          if (b && b.width > 0 && b.height > 0) {
-            setCustomRecordingBounds({
-              x: Math.max(0, b.x),
-              y: Math.max(0, b.y),
-              width: Math.max(100, Math.min(b.width, window.innerWidth)),
-              height: Math.max(100, Math.min(b.height, window.innerHeight)),
-            });
-          } else {
-            applyBoundsFromModelMetrics(model);
-          }
-        } catch (e) {
-          applyBoundsFromModelMetrics(model);
-        }
-      }
-    }
-  };
 
   useEffect(() => {
     (async () => {
@@ -1649,7 +1599,7 @@ export default function Live2DView() {
       if (appRef.current) {
         try {
           appRef.current.destroy(true, { children: true, texture: true, baseTexture: true });
-        } catch {}
+        } catch { /* 应用销毁失败不阻断清理 */ }
         appRef.current = null;
       }
       subtitleContainerRef.current = null;
@@ -1878,6 +1828,9 @@ export default function Live2DView() {
     onStopRecording: stopRecording,
     onSaveWebM: saveWebM,
     onConvertToMov: toMov,
+    onStartOfflineExport: () => void startOfflineExport("all"),
+    onStartSubtitleOnlyExport: () => void startOfflineExport("subtitle-only"),
+    onStartLive2DOnlyExport: () => void startOfflineExport("live2d-only"),
     onExportSubtitlesSrt: exportSubtitlesSrt,
     onTakeScreenshot: () => recordingManager.takeScreenshot(),
     onTakePartsScreenshots: () => recordingManager.takePartsScreenshots(),
@@ -1922,7 +1875,8 @@ export default function Live2DView() {
             <button
               className={`btn ${recState === "rec" ? "btn--danger" : "btn--accent"}`}
               onClick={recState === "rec" ? stopRecording : startRecording}
-              disabled={recState === "offline"}
+              disabled={recState === "offline" || !isVp9AlphaSupported()}
+              title={!isVp9AlphaSupported() ? "当前 WebView 不支持 VP9 Alpha 实时录制，请使用离线导出" : undefined}
             >
               {recState === "rec" ? "停止录制" : "录制 WebM"}
             </button>
