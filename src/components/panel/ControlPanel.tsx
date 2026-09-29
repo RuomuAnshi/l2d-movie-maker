@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ExportToolbar from "../ExportToolbar";
 import type { SubtitleClip } from "../timeline/clipTypes";
+import type { ModelPackage } from "../../utils/modelLibrary";
 
 interface Motion {
   name: string;
@@ -46,6 +47,14 @@ type Props = {
   selectedModel: string | null;
   onSelectModel: (relPath: string | null) => void;
   onRefreshModels?: () => void;
+  modelPackages: ModelPackage[];
+  isImportingModel: boolean;
+  onImportModel: () => void;
+  onImportModelFolder: () => void;
+  onDeleteModelPackage: (id: string) => void;
+  onSaveProject: () => void;
+  onOpenProject: () => void;
+  autosaveStatus: string;
 
   modelData: ModelData | null;
   motionLen: Record<string, number>;
@@ -200,6 +209,16 @@ export default function ControlPanel(props: Props) {
     onChangeInspectorTab,
     onToggleWebGALMode,
     selectedModel,
+    modelList,
+    modelPackages,
+    isImportingModel,
+    onImportModel,
+    onImportModelFolder,
+    onDeleteModelPackage,
+    onSaveProject,
+    onOpenProject,
+    autosaveStatus,
+    onSelectModel,
     onRefreshModels,
     modelData,
     motionLen,
@@ -529,6 +548,57 @@ export default function ControlPanel(props: Props) {
       <div ref={paneScrollRef} className="workspace-pane-scroll">
         {mode === "resources" ? (
           <>
+            <PanelSection title="模型库" meta={`${modelList.length} 个模型`}>
+              <div className="model-library-actions">
+                <button className="btn btn--accent" onClick={onImportModel} disabled={isImportingModel}>
+                  {isImportingModel ? "正在导入…" : "导入模型文件 / ZIP"}
+                </button>
+                <button className="btn btn--quiet" onClick={onImportModelFolder} disabled={isImportingModel}>
+                  选择模型文件夹
+                </button>
+              </div>
+              {modelList.length === 0 ? (
+                <div className="pane-empty model-library-empty">
+                  <strong>模型库还是空的</strong>
+                  <span>选择模型文件夹，或导入 .zip / 模型配置文件。资源会复制到应用管理的模型库。</span>
+                </div>
+              ) : (
+                <div className="model-library-list">
+                  {modelPackages.map((pack) => (
+                    <div className="model-library-package" key={pack.id}>
+                      <div className="model-library-package-head">
+                        <strong>{pack.name}</strong>
+                        <button className="btn btn--quiet model-library-remove" onClick={() => onDeleteModelPackage(pack.id)} title="从模型库移除">
+                          移除
+                        </button>
+                      </div>
+                      {pack.modelPaths.map((path) => (
+                        <button
+                          key={path}
+                          className={`model-library-entry ${selectedModel === path ? "is-active" : ""}`}
+                          onClick={() => onSelectModel(path)}
+                          title={path}
+                        >
+                          <span>{path.split("/").slice(-1)[0]}</span>
+                          <small>{selectedModel === path ? "当前预览" : "选择模型"}</small>
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                  {modelList.filter((path) => !modelPackages.some((pack) => pack.modelPaths.includes(path))).map((path) => (
+                    <button
+                      key={path}
+                      className={`model-library-entry model-library-entry--legacy ${selectedModel === path ? "is-active" : ""}`}
+                      onClick={() => onSelectModel(path)}
+                      title={path}
+                    >
+                      <span>{path.split("/").slice(-1)[0]}</span>
+                      <small>{selectedModel === path ? "当前预览" : "旧资源"}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </PanelSection>
             <PanelSection title="动作" meta={`${filteredMotions.length} 条`} className="workspace-section--library">
               <div className="toolbar-row">
                 <input
@@ -946,7 +1016,17 @@ export default function ControlPanel(props: Props) {
                   </div>
                 </PanelSection>
                 <PanelSection title="工程操作">
+                  <div className="autosave-note">
+                    <span>恢复点</span>
+                    <strong>{autosaveStatus}</strong>
+                  </div>
                   <div className="button-row">
+                    <button className="btn btn--accent" onClick={onSaveProject}>
+                      保存工程副本
+                    </button>
+                    <button className="btn btn--quiet" onClick={onOpenProject}>
+                      打开工程
+                    </button>
                     {onRefreshModels ? (
                       <button className="btn btn--quiet" onClick={onRefreshModels}>
                         刷新模型索引

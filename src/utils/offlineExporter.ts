@@ -75,7 +75,7 @@ function buildAudioManifest(audioTracks: AudioTrack[], fps: number): AudioManife
       path: source,
       startSec: alignedStart,
       endSec: alignedEnd,
-      gain: 1.0,
+      gain: 0.8,
     });
   }
 
@@ -121,6 +121,7 @@ export async function runOfflineWebMExport(params: OfflineExportParams): Promise
       pattern,
       outWebm,
       fps: safeFps,
+      targetDurationSec: totalFrames / safeFps,
       audioManifestJson: manifest.length > 0 ? JSON.stringify(manifest) : null,
     });
 

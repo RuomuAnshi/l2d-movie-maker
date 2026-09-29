@@ -33,10 +33,10 @@ type DragKind =
   | null;
 
 const trackConfig: Record<TrackKind, { label: string; sublabel: string; color: string }> = {
-  motion: { label: "动作轨", sublabel: "Motion", color: "#6b7aff" },
-  expr: { label: "表情轨", sublabel: "Expression", color: "#2fa38d" },
-  audio: { label: "音频轨", sublabel: "Audio", color: "#d7863f" },
-  subtitle: { label: "字幕轨", sublabel: "Subtitle", color: "#c96a6a" },
+  motion: { label: "动作轨", sublabel: "Motion", color: "#708a4b" },
+  expr: { label: "表情轨", sublabel: "Expression", color: "#5c8290" },
+  audio: { label: "音频轨", sublabel: "Audio", color: "#bd8043" },
+  subtitle: { label: "字幕轨", sublabel: "Subtitle", color: "#ad6551" },
 };
 
 function getAudioAudibleRatio(clip: Clip) {

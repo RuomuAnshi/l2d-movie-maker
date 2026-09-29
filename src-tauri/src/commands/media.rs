@@ -107,11 +107,11 @@ pub async fn alpha_to_mp4_flatten(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AudioManifestItem {
-    id: String,
     path: String,
-    startSec: f64,
-    endSec: f64,
+    start_sec: f64,
+    end_sec: f64,
     gain: f64,
 }
 
@@ -122,9 +122,15 @@ pub async fn encode_png_sequence_to_webm_alpha(
     pattern: String,
     out_webm: String,
     fps: u32,
+    target_duration_sec: f64,
     audio_manifest_json: Option<String>,
 ) -> Result<(), String> {
     let fps = if fps == 0 { 1 } else { fps };
+    let target_duration_sec = if target_duration_sec.is_finite() {
+        target_duration_sec.max(0.0)
+    } else {
+        0.0
+    };
     let frame_path = PathBuf::from(&frame_dir).join(&pattern);
 
     let mut args: Vec<String> = Vec::new();
@@ -143,6 +149,10 @@ pub async fn encode_png_sequence_to_webm_alpha(
                 .map_err(|e| format!("解析音频清单失败: {e}"))?;
         }
     }
+    manifest.retain(|item| {
+        item.start_sec.is_finite() && item.end_sec.is_finite() && item.gain.is_finite()
+            && item.end_sec.max(item.start_sec.max(0.0)) > item.start_sec.max(0.0)
+    });
 
     for item in &manifest {
         args.push("-i".into());
@@ -155,14 +165,14 @@ pub async fn encode_png_sequence_to_webm_alpha(
 
         for (idx, item) in manifest.iter().enumerate() {
             let input_index = idx + 1; // 0 是视频输入
-            let start = item.startSec.max(0.0);
-            let end = item.endSec.max(start);
+            let start = item.start_sec.max(0.0);
+            let end = item.end_sec.max(start);
             let dur = (end - start).max(0.0);
             if dur <= 0.0 {
                 continue;
             }
             let delay_ms = (start * 1000.0).round() as i64;
-            let gain = item.gain;
+            let gain = item.gain.clamp(0.0, 4.0);
             let tag = format!("a{}", idx);
 
             // [i:a]atrim=0:dur,asetpts,adelay=ms|ms,volume=gain[aN]
@@ -211,8 +221,10 @@ pub async fn encode_png_sequence_to_webm_alpha(
     args.push("1".into());
     if manifest.is_empty() {
         args.push("-an".into());
-    } else {
-        args.push("-shortest".into());
+    }
+    if target_duration_sec > 0.0 {
+        args.push("-t".into());
+        args.push(format!("{:.6}", target_duration_sec));
     }
     args.push(out_webm);
 
