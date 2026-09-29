@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import ExportToolbar from "../ExportToolbar";
 import type { SubtitleClip } from "../timeline/clipTypes";
 import type { ModelPackage } from "../../utils/modelLibrary";
+import type { VideoExportFormat, VideoExportMode } from "../../utils/videoExporter";
 
 interface Motion {
   name: string;
@@ -112,21 +113,13 @@ type Props = {
   setRecordingQuality: (quality: "low" | "medium" | "high") => void;
   transparentBg: boolean;
   setTransparentBg: (transparent: boolean) => void;
-  recState: "idle" | "rec" | "done" | "offline";
-  recordingTime: number;
-  recordingProgress: number;
-  blob: Blob | null;
-  onStartRecording: () => void;
-  onStopRecording: () => void;
-  onSaveWebM: () => void;
-  onConvertToMov: () => void;
-  onStartOfflineExport: () => void;
-  onStartSubtitleOnlyExport: () => void;
-  onStartLive2DOnlyExport: () => void;
+  exportState: "idle" | "done" | "exporting";
+  exportTime: number;
+  exportProgress: number;
+  onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => void;
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
-  isVp9AlphaSupported: () => boolean;
 };
 
 const inspectorTabs: Array<{ id: InspectorTab; label: string }> = [
@@ -266,21 +259,13 @@ export default function ControlPanel(props: Props) {
     setRecordingQuality,
     transparentBg,
     setTransparentBg,
-    recState,
-    recordingTime,
-    recordingProgress,
-    blob,
-    onStartRecording,
-    onStopRecording,
-    onSaveWebM,
-    onConvertToMov,
-    onStartOfflineExport,
-    onStartSubtitleOnlyExport,
-    onStartLive2DOnlyExport,
+    exportState,
+    exportTime,
+    exportProgress,
+    onExportVideo,
     onExportSubtitlesSrt,
     onTakeScreenshot,
     onTakePartsScreenshots,
-    isVp9AlphaSupported,
   } = props;
 
   const [motionQuery, setMotionQuery] = useState("");
@@ -290,6 +275,9 @@ export default function ControlPanel(props: Props) {
   const [exprQuery, setExprQuery] = useState("");
   const [exprPage, setExprPage] = useState(1);
   const [exprPageSize, setExprPageSize] = useState(12);
+  const [exportFormat, setExportFormat] = useState<VideoExportFormat>("webm");
+  const [exportMode, setExportMode] = useState<VideoExportMode>("all");
+  const [includeExportAudio, setIncludeExportAudio] = useState(true);
   const [availableSubtitleFonts, setAvailableSubtitleFonts] = useState<string[]>(FALLBACK_SUBTITLE_FONTS);
   const paneScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -714,11 +702,6 @@ export default function ControlPanel(props: Props) {
                 </PanelSection>
 
                 <PanelSection title="变换">
-                  <div className="pane-note">
-                    {characterTransformMode === "single-relative"
-                      ? "单模型坐标以预览区中心为 0，X / Y 使用百分比。"
-                      : "复合模型这里控制的是整组容器坐标，不是单个子角色的局部位置。"}
-                  </div>
                   <div className="transform-grid">
                     {transformFields.map(([key, label]) => (
                       <label key={key} className="field-stack">
@@ -828,7 +811,6 @@ export default function ControlPanel(props: Props) {
                   {subtitleClips.length === 0 ? (
                     <div className="pane-empty">
                       <strong>还没有字幕片段</strong>
-                      <span>可以手动新增，或在 WebGAL 导入时勾选字幕一起进入时间线。</span>
                     </div>
                   ) : (
                     <div className="subtitle-list">
@@ -916,27 +898,25 @@ export default function ControlPanel(props: Props) {
 
             {activeInspectorTab === "export" ? (
               <>
-                <PanelSection title="录制与导出">
+                <PanelSection title="导出视频">
                   <ExportToolbar
                     recordingQuality={recordingQuality}
                     setRecordingQuality={setRecordingQuality}
                     transparentBg={transparentBg}
                     setTransparentBg={setTransparentBg}
-                    recState={recState}
-                    recordingTime={recordingTime}
-                    recordingProgress={recordingProgress}
-                    blob={blob}
-                    onStartRecording={onStartRecording}
-                    onStopRecording={onStopRecording}
-                    onSaveWebM={onSaveWebM}
-                    onConvertToMov={onConvertToMov}
-                    onStartOfflineExport={onStartOfflineExport}
-                    onStartSubtitleOnlyExport={onStartSubtitleOnlyExport}
-                    onStartLive2DOnlyExport={onStartLive2DOnlyExport}
+                    includeAudio={includeExportAudio}
+                    setIncludeAudio={setIncludeExportAudio}
+                    exportFormat={exportFormat}
+                    setExportFormat={setExportFormat}
+                    exportMode={exportMode}
+                    setExportMode={setExportMode}
+                    exportState={exportState}
+                    exportTime={exportTime}
+                    exportProgress={exportProgress}
+                    onExportVideo={onExportVideo}
                     onExportSubtitlesSrt={onExportSubtitlesSrt}
                     onTakeScreenshot={onTakeScreenshot}
                     onTakePartsScreenshots={onTakePartsScreenshots}
-                    isVp9AlphaSupported={isVp9AlphaSupported}
                   />
                 </PanelSection>
                 <PanelSection title="会话状态">
@@ -954,8 +934,8 @@ export default function ControlPanel(props: Props) {
                       <strong>{typeof currentFps === "number" ? currentFps.toFixed(1) : "--"}</strong>
                     </div>
                     <div className="stat-card">
-                      <span>录制状态</span>
-                      <strong>{recState === "rec" ? "录制中" : recState === "offline" ? "离线导出中" : recState === "done" ? "可下载" : "待机"}</strong>
+                      <span>导出状态</span>
+                      <strong>{exportState === "exporting" ? "导出中" : exportState === "done" ? "已完成" : "待机"}</strong>
                     </div>
                   </div>
                 </PanelSection>

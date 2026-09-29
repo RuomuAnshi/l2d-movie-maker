@@ -191,16 +191,13 @@
 }
 
 .btn--accent,
-.record-button,
-.offline-button,
-.convert-button,
+.export-video-button,
 .parts-screenshot-button {
   background: #5c8243;
   box-shadow: none;
 }
 
-.btn--danger,
-.stop-button {
+.btn--danger {
   background: #b25343;
 }
 
@@ -359,7 +356,7 @@ textarea.input {
 }
 
 .timeline-shell {
-  flex-basis: clamp(250px, 31vh, 350px);
+  flex-basis: clamp(210px, 25vh, 300px);
   padding: 0 12px 12px;
 }
 

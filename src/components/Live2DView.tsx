@@ -11,17 +11,16 @@ import ControlPanel, { type InspectorTab } from "./panel/ControlPanel";
 import ModelManager from "./ModelManager";
 import type { JsonlLive2DModel } from "./ModelManager";
 import AudioManager from "./AudioManager";
-import RecordingManager from "./RecordingManager";
+import ScreenshotManager from "./ScreenshotManager";
 import WebGALMode from "./WebGALMode";
 import AlertModal from "./AlertModal";
 // import { convertFileSrc } from "@tauri-apps/api/core";
 // import { normalizePath } from "../utils/fs";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import { appCacheDir, BaseDirectory, dirname, join } from "@tauri-apps/api/path";
+import { dirname, join } from "@tauri-apps/api/path";
 import { remove, writeFile } from "@tauri-apps/plugin-fs";
-import { isVp9AlphaSupported } from "../utils/recorder";
-import { runOfflineWebMExport } from "../utils/offlineExporter";
+import { runVideoExport, type VideoExportFormat, type VideoExportMode } from "../utils/videoExporter";
 import {
   buildWebGALExternalAssetUrl,
   loadWebGALMotionDurations,
@@ -61,7 +60,6 @@ type RendererWithBackground = PIXI.Renderer & {
   clearBeforeRender: boolean;
   gl?: WebGLRenderingContext | WebGL2RenderingContext | null;
 };
-type ExportVisualMode = "all" | "subtitle-only" | "live2d-only";
 type SubtitleSpeakerAlign = "left" | "center" | "right";
 const PLAYHEAD_UI_INTERVAL_MS = 1000 / 30;
 const EXPORT_PROGRESS_UI_INTERVAL_MS = 100;
@@ -148,12 +146,10 @@ export default function Live2DView() {
   const [motionLen, setMotionLen] = useState<MotionLenMap>({});
 
   // ????? ???//
-  const [recState, setRecState] = useState<"idle" | "rec" | "done" | "offline">("idle");
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [recordingProgress, setRecordingProgress] = useState(0);
+  const [exportState, setExportState] = useState<"idle" | "done" | "exporting">("idle");
+  const [exportTime, setExportTime] = useState(0);
+  const [exportProgress, setExportProgress] = useState(0);
   const [transparentBg, setTransparentBg] = useState(true);
-  const [blob, setBlob] = useState<Blob | null>(null);
-  const [blobDefaultName, setBlobDefaultName] = useState("export.webm");
   
   // ????????????????//
   const [customRecordingBounds, setCustomRecordingBounds] = useState({ x: 0, y: 0, width: 800, height: 600 });
@@ -1050,16 +1046,6 @@ export default function Live2DView() {
     };
   }, []);
 
-  // ??????
-  const startRecording = () => {
-    setBlobDefaultName("export.webm");
-    recordingManager.start();
-  };
-
-  const stopRecording = () => {
-    recordingManager.stop();
-  };
-
   const formatSrtTimestamp = (timeSec: number) => {
     const totalMs = Math.max(0, Math.round(timeSec * 1000));
     const hours = Math.floor(totalMs / 3_600_000);
@@ -1097,9 +1083,13 @@ export default function Live2DView() {
     await writeFile(out, new TextEncoder().encode(content));
   };
 
-  const startOfflineExport = async (mode: ExportVisualMode = "all") => {
+  const exportVideo = async (
+    format: VideoExportFormat,
+    mode: VideoExportMode,
+    includeAudio: boolean,
+  ) => {
     if (!canvasRef.current || !appRef.current) return;
-    if (recState === "rec" || recState === "offline") return;
+    if (exportState === "exporting") return;
 
     if (mode === "subtitle-only" && subtitleClips.length === 0) {
       showAlert("当前没有可导出的字幕轨内容");
@@ -1127,11 +1117,30 @@ export default function Live2DView() {
     const settings = qualitySettings[recordingQuality];
     const targetFrames = Math.max(1, Math.ceil(totalDuration * settings.fps));
 
-    const blobOnlyAudio = audioClips.filter(c => c.audioUrl && !c.audioPath && /^blob:/i.test(c.audioUrl));
+    const blobOnlyAudio = includeAudio
+      ? audioClips.filter(c => c.audioUrl && !c.audioPath && /^blob:/i.test(c.audioUrl))
+      : [];
     if (blobOnlyAudio.length > 0) {
-      showAlert(`错误: 有 ${blobOnlyAudio.length} 条临时 blob 音频无法用于离线导出，请删除后从文件重新导入音频`);
+      showAlert(`有 ${blobOnlyAudio.length} 条临时音频无法导出，请重新导入音频文件`);
       return;
     }
+
+    const baseName = mode === "subtitle-only" ? "subtitles-only" : mode === "live2d-only" ? "live2d-only" : "export";
+    let selectedPath: string | null;
+    try {
+      selectedPath = await save({
+        defaultPath: `${baseName}.${format}`,
+        filters: [{ name: format === "webm" ? "WebM" : "MOV", extensions: [format] }],
+      });
+    } catch (error) {
+      showAlert("无法选择导出位置: " + String(error));
+      return;
+    }
+    if (!selectedPath) return;
+    const hasExtension = /\.[^./\\]+$/.test(selectedPath);
+    const outputPath = hasExtension
+      ? selectedPath.replace(/\.[^./\\]+$/, `.${format}`)
+      : `${selectedPath}.${format}`;
 
     const hasValidBounds = customRecordingBounds && customRecordingBounds.width > 0 && customRecordingBounds.height > 0;
     const shouldUseModelFrame = hasValidBounds && useModelFrame;
@@ -1144,9 +1153,9 @@ export default function Live2DView() {
       exportCtx = exportCanvas.getContext('2d');
     }
 
-    setRecState('offline');
-    setRecordingTime(0);
-    setRecordingProgress(0);
+    setExportState('exporting');
+    setExportTime(0);
+    setExportProgress(0);
     stopPlayback();
 
     const app = appRef.current;
@@ -1155,7 +1164,7 @@ export default function Live2DView() {
     let prepInterval: number | null = null;
     let firstFrame = false;
     const prepStart = Date.now();
-    let offlineTickerTimeMs = performance.now();
+    let exportTickerTimeMs = performance.now();
     let lastExportProgressUiTs = 0;
     const previousModelVisibility = getModelVisibilitySnapshot();
     const previousSubtitleOverride = subtitleVisibilityOverrideRef.current;
@@ -1163,27 +1172,24 @@ export default function Live2DView() {
     if (mode === "subtitle-only") {
       setModelVisibility(false);
       subtitleVisibilityOverrideRef.current = true;
-      setBlobDefaultName("subtitles-only.webm");
     } else if (mode === "live2d-only") {
       setModelVisibility(true);
       subtitleVisibilityOverrideRef.current = false;
-      setBlobDefaultName("live2d-only.webm");
     } else {
       setModelVisibility(true);
       subtitleVisibilityOverrideRef.current = null;
-      setBlobDefaultName("export.webm");
     }
     renderSubtitleClip(findActiveClip(subtitleClips, playheadRef.current) as SubtitleClip | null);
 
-    const updateOfflineExportUi = (timeSec: number, progressPct: number, force: boolean = false) => {
+    const updateExportUi = (timeSec: number, progressPct: number, force: boolean = false) => {
       const now = performance.now();
       if (!force && now - lastExportProgressUiTs < EXPORT_PROGRESS_UI_INTERVAL_MS) {
         return;
       }
       lastExportProgressUiTs = now;
       startTransition(() => {
-        setRecordingTime(timeSec);
-        setRecordingProgress(progressPct);
+        setExportTime(timeSec);
+        setExportProgress(progressPct);
       });
     };
 
@@ -1192,17 +1198,19 @@ export default function Live2DView() {
         if (firstFrame) return;
         const elapsed = (Date.now() - prepStart) / 1000;
         const pct = Math.min(0.05, elapsed * 0.2);
-        updateOfflineExportUi(elapsed, pct * 100);
+        updateExportUi(elapsed, pct * 100);
       }, 100);
-      const result = await runOfflineWebMExport({
+      await runVideoExport({
         canvas: exportCanvas,
+        outputPath,
+        format,
         fps: settings.fps,
         targetFrameCount: targetFrames,
         applyTimelineAtTime: (timeSec) => applyTimelineAtTime(timeSec, true),
         renderFrame: () => {
-          offlineTickerTimeMs += 1000 / settings.fps;
+          exportTickerTimeMs += 1000 / settings.fps;
           // Application already binds render() to ticker, so one ticker update is enough.
-          app.ticker.update(offlineTickerTimeMs);
+          app.ticker.update(exportTickerTimeMs);
           if (exportCtx) {
             if (transparentBg) {
               exportCtx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
@@ -1228,29 +1236,29 @@ export default function Live2DView() {
           audioUrl: c.audioUrl,
           audioPath: c.audioPath
         })),
+        includeAudio,
         onProgress: ({ frameIndex, totalFrames, timeSec }) => {
           if (!firstFrame) {
             firstFrame = true;
             if (prepInterval) { clearInterval(prepInterval); prepInterval = null; }
           }
-          updateOfflineExportUi(
+          updateExportUi(
             timeSec,
-            (frameIndex / totalFrames) * 100,
+            Math.min(85, (frameIndex / totalFrames) * 85),
             frameIndex >= totalFrames,
           );
         }
       });
 
-      setBlob(result.blob);
-      setRecState('done');
-      setRecordingTime(0);
-      setRecordingProgress(0);
+      setExportState('done');
+      setExportTime(0);
+      setExportProgress(0);
     } catch (error) {
-      console.error('离线导出失败:', error);
-      showAlert("离线导出失败: " + String(error));
-      setRecState('idle');
-      setRecordingTime(0);
-      setRecordingProgress(0);
+      console.error('视频导出失败:', error);
+      showAlert("视频导出失败: " + String(error));
+      setExportState('idle');
+      setExportTime(0);
+      setExportProgress(0);
     } finally {
       restoreModelVisibility(previousModelVisibility);
       subtitleVisibilityOverrideRef.current = previousSubtitleOverride;
@@ -1260,52 +1268,7 @@ export default function Live2DView() {
     }
   };
 
-  const recordingManager = RecordingManager({
-    canvasRef,
-    modelRef,
-    motionClips,
-    exprClips,
-    audioClips,
-    subtitleClips,
-    recordingQuality,
-    customRecordingBounds,
-    useModelFrame,
-    setRecState,
-    setRecordingTime,
-    setRecordingProgress,
-    setBlob,
-    prepareAudioRecording: async () => {
-      await audioManager.resumeAudioContext();
-      return audioManager.recordingDestinationRef.current?.stream ?? null;
-    },
-    startPlayback,
-    stopPlayback,
-    showAlert
-  });
-
-  const saveWebM = async () => {
-    if (!blob) return;
-    const out = await save({
-      defaultPath: blobDefaultName,
-      filters: [{ name: "WebM", extensions: ["webm"] }],
-    });
-    if (!out) return;
-    await writeFile(out, new Uint8Array(await blob.arrayBuffer()));
-  };
-
-  const toMov = async () => {
-    if (!blob) return;
-    const name = `alpha-${Date.now()}.webm`;
-    await writeFile(name, new Uint8Array(await blob.arrayBuffer()), { baseDir: BaseDirectory.AppCache });
-    const abs = await join(await appCacheDir(), name);
-    try {
-      const out = await save({ defaultPath: "export-4444.mov", filters: [{ name: "MOV", extensions: ["mov"] }] });
-      if (!out) return;
-      await invoke("vp9_to_prores4444", { inWebm: abs, outMov: out });
-    } finally {
-      try { await remove(abs); } catch { /* 临时转码文件清理失败可忽略 */ }
-    }
-  };
+  const screenshotManager = ScreenshotManager({ canvasRef, modelRef, showAlert });
 
   // ??WebGAL??????
   const exitWebGALMode = () => {
@@ -1523,17 +1486,10 @@ export default function Live2DView() {
       showAlert("模型库尚未初始化，请稍后再试。");
       return;
     }
-    const selectedPath = await open(pickFolder
-      ? { directory: true, multiple: false, title: "选择 Live2D 模型文件夹" }
-      : {
-          multiple: false,
-          title: "导入 Live2D 模型",
-          filters: [{ name: "Live2D 模型", extensions: ["zip", "json", "jsonl"] }],
-        });
-    if (typeof selectedPath !== "string") return;
-
     setIsImportingModel(true);
     try {
+      const selectedPath = await invoke<string | null>("pick_model_source", { directory: pickFolder });
+      if (typeof selectedPath !== "string") return;
       const imported = await importModelSource(selectedPath, modelRoot);
       const nextModelList = await invoke<string[]>("refresh_model_index");
       const importedPaths = nextModelList.filter((path) => path.startsWith(`${imported.id}/`));
@@ -2069,21 +2025,15 @@ export default function Live2DView() {
     setRecordingQuality,
     transparentBg,
     setTransparentBg,
-    recState,
-    recordingTime,
-    recordingProgress,
-    blob,
-    onStartRecording: startRecording,
-    onStopRecording: stopRecording,
-    onSaveWebM: saveWebM,
-    onConvertToMov: toMov,
-    onStartOfflineExport: () => void startOfflineExport("all"),
-    onStartSubtitleOnlyExport: () => void startOfflineExport("subtitle-only"),
-    onStartLive2DOnlyExport: () => void startOfflineExport("live2d-only"),
+    exportState,
+    exportTime,
+    exportProgress,
+    onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => {
+      void exportVideo(format, mode, includeAudio);
+    },
     onExportSubtitlesSrt: exportSubtitlesSrt,
-    onTakeScreenshot: () => recordingManager.takeScreenshot(),
-    onTakePartsScreenshots: () => recordingManager.takePartsScreenshots(),
-    isVp9AlphaSupported,
+    onTakeScreenshot: () => screenshotManager.takeScreenshot(),
+    onTakePartsScreenshots: () => screenshotManager.takePartsScreenshots(),
   };
 
   return (
@@ -2123,14 +2073,6 @@ export default function Live2DView() {
             </button>
             <button className={`btn ${isPlaying ? "btn--accent" : "btn--primary"}`} onClick={isPlaying ? stopPlayback : startPlayback} disabled={!timelineLength && !isPlaying}>
               {isPlaying ? "停止播放" : "开始播放"}
-            </button>
-            <button
-              className={`btn ${recState === "rec" ? "btn--danger" : "btn--accent"}`}
-              onClick={recState === "rec" ? stopRecording : startRecording}
-              disabled={recState === "offline" || !isVp9AlphaSupported()}
-              title={!isVp9AlphaSupported() ? "当前 WebView 不支持 VP9 Alpha 实时录制，请使用离线导出" : undefined}
-            >
-              {recState === "rec" ? "停止录制" : "录制 WebM"}
             </button>
             <button className="btn btn--quiet" onClick={addAudioClip}>
               导入音频
