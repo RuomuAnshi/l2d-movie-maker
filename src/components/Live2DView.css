@@ -127,7 +127,7 @@
   min-width: 0;
   display: grid;
   grid-template-columns: clamp(280px, 23vw, 360px) minmax(0, 1fr) clamp(310px, 25vw, 390px);
-  gap: 14px;
+  gap: 0;
   padding: 14px;
   overflow: hidden;
 }
@@ -1425,7 +1425,7 @@
 
   .editor-workspace {
     grid-template-columns: 248px minmax(0, 1fr) 300px;
-    gap: 10px;
+    gap: 0;
     padding: 10px;
   }
 
@@ -1485,4 +1485,69 @@
     transition: none !important;
     animation: none !important;
   }
+}
+
+.workspace-resizer {
+  position: relative;
+  z-index: 8;
+  align-self: stretch;
+  width: 14px;
+  height: 100%;
+  justify-self: center;
+  cursor: col-resize !important;
+  background: transparent;
+  touch-action: none;
+  user-select: none;
+}
+
+.workspace-resizer::after {
+  position: absolute;
+  inset: 0 5px;
+  content: "";
+  border-radius: 4px;
+  background: rgba(108, 82, 48, 0.36);
+  transition: background-color 120ms ease, inset 120ms ease;
+}
+
+.workspace-resizer:hover::after,
+.workspace-resizer:focus-visible::after,
+.workspace-resizer:active::after {
+  inset-inline: 3px;
+  background: #8ca85e;
+}
+
+.workspace-resizer:focus-visible,
+.timeline-resizer:focus-visible {
+  outline: 2px solid #8ca85e;
+  outline-offset: -2px;
+}
+
+.timeline-resizer {
+  position: relative;
+  z-index: 7;
+  flex: 0 0 10px;
+  width: 100%;
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.timeline-resizer::after {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  width: 44px;
+  height: 2px;
+  content: "";
+  transform: translateX(-50%);
+  border-radius: 2px;
+  background: rgba(108, 82, 48, 0.6);
+  transition: width 120ms ease, background-color 120ms ease;
+}
+
+.timeline-resizer:hover::after,
+.timeline-resizer:focus-visible::after,
+.timeline-resizer:active::after {
+  width: 72px;
+  background: #8ca85e;
 }

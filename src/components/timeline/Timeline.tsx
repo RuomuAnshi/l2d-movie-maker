@@ -58,11 +58,11 @@ export default function Timeline(p: Props) {
     area = useRef<HTMLDivElement>(null);
   const parameterElements = useRef(new Map<string, HTMLDivElement>());
   useEffect(() => {
-    if (graph && focused)
+    if (focused)
       parameterElements.current
         .get(focused)
         ?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [graph, focused]);
+  }, [graph, focused, selected]);
   const document = p.animation;
   const previousGroupCount = useRef(0);
   useEffect(() => {

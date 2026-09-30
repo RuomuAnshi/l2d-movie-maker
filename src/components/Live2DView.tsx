@@ -61,6 +61,7 @@ interface ModelData {
 type MotionLenMap = Record<string, number>;
 type CharacterOption = { id: string; label: string };
 type CharacterTransform = { x: number; y: number; scaleX: number; scaleY: number; rotation: number };
+type PanelResizeDrag = { side: "left" | "right"; startX: number; startWidth: number };
 type CharacterTransformMode = "single-relative" | "composite-container";
 type TransformTarget = Pick<PIXI.Container, "position" | "scale" | "rotation" | "getBounds">;
 type RendererWithBackground = PIXI.Renderer & {
@@ -232,6 +233,10 @@ export default function Live2DView() {
   // ???WebGAL?? ???//
   // const [showWebGALMode, setShowWebGALMode] = useState(false);
   const [activeInspectorTab, setActiveInspectorTab] = useState<InspectorTab>("character");
+  const [resourcePaneWidth, setResourcePaneWidth] = useState(280);
+  const [inspectorPaneWidth, setInspectorPaneWidth] = useState(320);
+  const [timelinePaneHeight, setTimelinePaneHeight] = useState(() => Math.max(210, Math.min(300, window.innerHeight * 0.25)));
+  const panelResizeDragRef = useRef<PanelResizeDrag | null>(null);
 
   // ??????
   const modelManager = ModelManager({
@@ -448,6 +453,89 @@ export default function Live2DView() {
     const uniformScale = Math.max(0.01, (current.scaleX + current.scaleY) / 2);
     const nextScale = Math.max(0.01, Math.min(10, uniformScale * multiplier));
     updateSelectedCharacterTransform({ scaleX: nextScale, scaleY: nextScale });
+  };
+
+  const paneWidthLimits = (side: PanelResizeDrag["side"]) => {
+    const min = side === "left" ? 220 : 240;
+    return { min, max: Math.max(min, Math.min(600, window.innerWidth * 0.36)) };
+  };
+
+  const beginPanelResize = (
+    side: PanelResizeDrag["side"],
+    event: React.MouseEvent<HTMLDivElement>,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    panelResizeDragRef.current = {
+      side,
+      startX: event.clientX,
+      startWidth: side === "left" ? resourcePaneWidth : inspectorPaneWidth,
+    };
+    const move = (moveEvent: MouseEvent) => {
+      const drag = panelResizeDragRef.current;
+      if (!drag) return;
+      const delta = (moveEvent.clientX - drag.startX) * (drag.side === "left" ? 1 : -1);
+      const limits = paneWidthLimits(drag.side);
+      const width = Math.max(limits.min, Math.min(limits.max, drag.startWidth + delta));
+      if (drag.side === "left") setResourcePaneWidth(width);
+      else setInspectorPaneWidth(width);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      panelResizeDragRef.current = null;
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
+  const resizePaneWithKeyboard = (
+    side: PanelResizeDrag["side"],
+    event: React.KeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    const direction = event.key === "ArrowRight" ? 1 : -1;
+    const amount = direction * (event.shiftKey ? 32 : 12) * (side === "left" ? 1 : -1);
+    const limits = paneWidthLimits(side);
+    const next = Math.max(
+      limits.min,
+      Math.min(
+        limits.max,
+        (side === "left" ? resourcePaneWidth : inspectorPaneWidth) + amount,
+      ),
+    );
+    if (side === "left") setResourcePaneWidth(next);
+    else setInspectorPaneWidth(next);
+  };
+
+  const beginTimelineResize = (event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startY = event.clientY;
+    const startHeight = timelinePaneHeight;
+    const move = (moveEvent: MouseEvent) => {
+      const maxHeight = Math.max(150, Math.min(640, window.innerHeight * 0.72));
+      const height = Math.max(
+        150,
+        Math.min(maxHeight, startHeight + startY - moveEvent.clientY),
+      );
+      setTimelinePaneHeight(height);
+    };
+    const up = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  };
+
+  const resizeTimelineWithKeyboard = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+    event.preventDefault();
+    const amount = (event.key === "ArrowUp" ? 1 : -1) * (event.shiftKey ? 32 : 12);
+    const maxHeight = Math.max(150, Math.min(640, window.innerHeight * 0.72));
+    setTimelinePaneHeight((height) => Math.max(150, Math.min(maxHeight, height + amount)));
   };
 
 
@@ -1983,41 +2071,35 @@ export default function Live2DView() {
 
   useEffect(() => {
     const handleWheelTransform = (event: WheelEvent) => {
-      if (!enableDragging || !isDraggingRef.current) return;
-      if (!event.ctrlKey && !event.altKey) return;
-      if (
-        event.target instanceof HTMLInputElement ||
-        event.target instanceof HTMLTextAreaElement ||
-        event.target instanceof HTMLSelectElement
-      ) {
-        return;
-      }
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
+      const canvas = canvasRef.current;
+      const app = appRef.current;
+      if (!canvas || !app) return;
 
-      if (event.ctrlKey) {
-        event.preventDefault();
-        event.stopPropagation();
-        updateUniformScale(event.deltaY > 0 ? 0.96 : 1.04);
-        return;
-      }
+      const rect = canvas.getBoundingClientRect();
+      const x = ((event.clientX - rect.left) / Math.max(1, rect.width)) * app.screen.width;
+      const y = ((event.clientY - rect.top) / Math.max(1, rect.height)) * app.screen.height;
+      const overSelectedCharacter = getSelectedCharacterDisplayObjects().some((object) => {
+        if (!object.visible) return false;
+        try {
+          const bounds = object.getBounds();
+          return x >= bounds.x && x <= bounds.x + bounds.width && y >= bounds.y && y <= bounds.y + bounds.height;
+        } catch { return false; }
+      });
+      if (!overSelectedCharacter) return;
 
-      if (event.altKey) {
-        event.preventDefault();
-        event.stopPropagation();
-        const current = characterTransformRef.current;
-        updateSelectedCharacterTransform({ rotation: current.rotation + (event.deltaY > 0 ? 4 : -4) });
-      }
+      event.preventDefault();
+      event.stopPropagation();
+      const delta = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? event.deltaY * 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? event.deltaY * rect.height : event.deltaY;
+      updateUniformScale(Math.exp(-Math.max(-240, Math.min(240, delta)) * 0.001));
     };
 
     const canvas = canvasRef.current;
     if (!canvas) return;
     const wheelListenerOptions: AddEventListenerOptions = { passive: false, capture: true };
-
     canvas.addEventListener("wheel", handleWheelTransform, wheelListenerOptions);
-    return () => {
-      canvas.removeEventListener("wheel", handleWheelTransform, wheelListenerOptions);
-    };
-  }, [enableDragging, modelUrl]);
-
+    return () => canvas.removeEventListener("wheel", handleWheelTransform, wheelListenerOptions);
+  }, [modelUrl, selectedCharacterId]);
 
   // ?????????????????
   useEffect(() => {
@@ -2229,13 +2311,29 @@ export default function Live2DView() {
 
       </header>
 
-      <div className="editor-workspace">
+      <div
+        className="editor-workspace"
+        style={{ gridTemplateColumns: `${resourcePaneWidth}px 14px minmax(0, 1fr) 14px ${inspectorPaneWidth}px` }}
+      >
         <aside className="workspace-dock workspace-dock--left" inert={exportState === "exporting"}>
           <ControlPanel
             {...panelProps}
             mode="resources"
           />
         </aside>
+
+        <div
+          className="workspace-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整素材面板宽度"
+          tabIndex={0}
+          onMouseDown={(event) => beginPanelResize("left", event)}
+          aria-valuemin={paneWidthLimits("left").min}
+          aria-valuemax={paneWidthLimits("left").max}
+          aria-valuenow={resourcePaneWidth}
+          onKeyDown={(event) => resizePaneWithKeyboard("left", event)}
+        />
 
         <main className="editor-main" inert={exportState === "exporting"}>
           <section className="monitor-shell">
@@ -2275,6 +2373,19 @@ export default function Live2DView() {
           </section>
         </main>
 
+        <div
+          className="workspace-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="调整检查器宽度"
+          tabIndex={0}
+          onMouseDown={(event) => beginPanelResize("right", event)}
+          aria-valuemin={paneWidthLimits("right").min}
+          aria-valuemax={paneWidthLimits("right").max}
+          aria-valuenow={inspectorPaneWidth}
+          onKeyDown={(event) => resizePaneWithKeyboard("right", event)}
+        />
+
         <aside className="workspace-dock workspace-dock--right">
           <ControlPanel
             {...panelProps}
@@ -2285,7 +2396,19 @@ export default function Live2DView() {
         </aside>
       </div>
 
-      <section className="timeline-shell" inert={exportState === "exporting"}>
+      <div
+        className="timeline-resizer"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="调整时间线高度"
+        tabIndex={0}
+        aria-valuemin={150}
+        aria-valuemax={Math.max(150, Math.min(640, window.innerHeight * 0.72))}
+        aria-valuenow={Math.round(timelinePaneHeight)}
+        onMouseDown={beginTimelineResize}
+        onKeyDown={resizeTimelineWithKeyboard}
+      />
+      <section className="timeline-shell" style={{ flexBasis: `${timelinePaneHeight}px` }} inert={exportState === "exporting"}>
         {animationIssue && <div className="timeline-repair"><span>{animationIssue}</span><button className="btn btn--quiet" onClick={() => {
           if (modelData) setProjectRevision(revision => revision + 1);
           else if (appRef.current && modelUrl) void modelManager.loadAnyModel(appRef.current, modelUrl).catch(error => setAnimationIssue(`模型加载失败：${String(error)}`));

@@ -6,27 +6,71 @@
 }
 .parameter-timeline .tl-header {
   flex-shrink: 0;
-  gap: 8px;
-  padding: 6px 10px;
+  gap: 3px;
+  min-height: 24px;
+  align-items: center;
+  padding: 0 4px;
+}
+.parameter-timeline .tl-header > strong {
+  font-size: 12px;
+  line-height: 18px;
+}
+.parameter-timeline .tl-header .btn {
+  min-height: 22px;
+  height: 22px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 18px;
 }
 .parameter-timeline .tl-toolbar {
-  gap: 6px;
+  gap: 3px;
+  align-items: center;
   flex-wrap: wrap;
+}
+.parameter-timeline .tl-toolbar input,
+.parameter-timeline .tl-toolbar select {
+  height: 22px;
+  min-height: 22px;
+  padding: 1px 5px;
+  font-size: 11px;
+  line-height: 18px;
 }
 .parameter-timeline .tl-toolbar input[type="text"],
 .parameter-timeline .tl-toolbar input:not([type]) {
-  width: 125px;
+  width: 105px;
+}
+.parameter-timeline .tl-toolbar label,
+.parameter-timeline .tl-toolbar > span {
+  font-size: 11px;
+  line-height: 18px;
+}
+.parameter-timeline .tl-toolbar input[type="checkbox"] {
+  width: 13px;
+  height: 13px;
+  min-height: 0;
 }
 .parameter-inspector {
   display: flex;
-  gap: 8px;
+  min-height: 25px;
+  gap: 4px;
   align-items: center;
-  padding: 4px 10px;
-  border-bottom: 2px solid #b29b6e;
+  padding: 1px 4px;
+  border-bottom: 1px solid #b29b6e;
   flex-wrap: wrap;
 }
+.parameter-inspector strong,
+.parameter-inspector label {
+  font-size: 11px;
+}
+.parameter-inspector .btn,
+.parameter-inspector input {
+  min-height: 21px;
+  height: 21px;
+  padding-block: 0;
+  font-size: 11px;
+}
 .parameter-inspector input[type="number"] {
-  width: 78px;
+  width: 64px;
 }
 .parameter-scroll {
   overflow: auto;
@@ -156,8 +200,8 @@
   left: 0;
 }
 .tl-root.parameter-timeline {
-  padding: 6px;
-  gap: 4px;
+  padding: 3px 5px;
+  gap: 2px;
   overflow: hidden;
 }
 .parameter-timeline .tl-layout {
