@@ -402,7 +402,6 @@
 .button-row,
 .asset-pager,
 .meter-row,
-.recording-quality-options,
 .recording-bounds-settings {
   display: flex;
   align-items: center;
@@ -785,24 +784,19 @@
 }
 
 .btn--accent,
-.record-button,
-.offline-button,
-.convert-button,
+.export-video-button,
 .parts-screenshot-button {
   background: linear-gradient(180deg, rgba(45, 212, 191, 0.96), rgba(34, 179, 159, 0.98));
   box-shadow: var(--glow-sm);
 }
 
 .btn--accent:hover,
-.record-button:hover,
-.offline-button:hover,
-.convert-button:hover,
+.export-video-button:hover,
 .parts-screenshot-button:hover {
   box-shadow: var(--glow-md);
 }
 
-.btn--danger,
-.stop-button {
+.btn--danger {
   background: linear-gradient(180deg, rgba(248, 113, 113, 0.96), rgba(220, 80, 80, 0.98));
 }
 
@@ -965,7 +959,7 @@
 }
 
 .timeline-shell {
-  flex: 0 0 clamp(250px, 31vh, 350px);
+  flex: 0 0 clamp(210px, 25vh, 300px);
   padding: 0 14px 14px;
   min-width: 0;
   overflow: hidden;
@@ -996,7 +990,7 @@
 }
 
 .tl-title {
-  margin: 4px 0 6px;
+  margin: 0;
   font-size: var(--text-lg);
 }
 
@@ -1037,7 +1031,7 @@
 
 .tl-layout {
   flex: 0 0 auto;
-  min-height: 282px;
+  min-height: 226px;
   display: grid;
   grid-template-columns: 136px minmax(0, 1fr);
   overflow: hidden;
@@ -1046,7 +1040,7 @@
 
 .tl-side {
   display: grid;
-  grid-template-rows: 34px repeat(4, 62px);
+  grid-template-rows: 34px repeat(4, 48px);
   background: linear-gradient(180deg, rgba(16, 22, 30, 0.98), rgba(12, 17, 24, 0.98));
   border-right: 1px solid rgba(46, 58, 74, 0.34);
   border-radius: var(--radius-md) 0 0 var(--radius-md);
@@ -1133,7 +1127,7 @@
 
 .tl-track-row {
   position: relative;
-  min-height: 62px;
+  min-height: 48px;
 }
 
 .tl-lane {
@@ -1291,19 +1285,31 @@
   display: block;
 }
 
-.recording-quality-section,
+.recording-controls {
+  display: grid;
+  gap: 14px;
+}
+
+.export-options-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.export-options-grid .field-stack {
+  min-width: 0;
+}
+
+.export-options-grid .input {
+  min-width: 0;
+}
+
 .recording-progress {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 
-.recording-quality-title {
-  font-size: var(--text-sm);
-  color: var(--text-dim);
-}
-
-.recording-quality-option,
 .transparent-bg-label {
   display: inline-flex;
   align-items: center;
@@ -1311,16 +1317,12 @@
   color: var(--text-soft);
 }
 
-.recording-quality-radio,
 .transparent-bg-checkbox {
   accent-color: var(--accent);
 }
 
-.record-button,
-.stop-button,
-.offline-button,
+.export-video-button,
 .download-button,
-.convert-button,
 .screenshot-button,
 .parts-screenshot-button {
   min-height: 40px;
@@ -1332,6 +1334,10 @@
   font-family: var(--font-body);
   font-size: var(--text-sm);
   font-weight: 600;
+}
+
+.export-video-button {
+  width: 100%;
 }
 
 .recording-progress-bar {

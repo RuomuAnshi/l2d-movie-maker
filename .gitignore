@@ -27,3 +27,6 @@ CLAUDE.md
 .claude/
 AGENTS.
 --help/
+
+# macOS AppleDouble sidecars (created on exFAT/removable drives)
+._*

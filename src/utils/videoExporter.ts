@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { appCacheDir, join } from "@tauri-apps/api/path";
-import { mkdir, readFile, remove, writeFile } from "@tauri-apps/plugin-fs";
+import { mkdir, remove, writeFile } from "@tauri-apps/plugin-fs";
+
+export type VideoExportFormat = "webm" | "mov";
+export type VideoExportMode = "all" | "subtitle-only" | "live2d-only";
 
 type AudioTrack = {
   id: string;
@@ -17,13 +20,16 @@ type ProgressPayload = {
   timeSec: number;
 };
 
-type OfflineExportParams = {
+type VideoExportParams = {
   canvas: HTMLCanvasElement;
+  outputPath: string;
+  format: VideoExportFormat;
   fps: number;
   targetFrameCount: number;
   applyTimelineAtTime: (timeSec: number, offline: boolean) => void | Promise<void>;
   renderFrame: () => void;
   audioTracks: AudioTrack[];
+  includeAudio: boolean;
   onProgress?: (payload: ProgressPayload) => void;
 };
 
@@ -75,15 +81,14 @@ function buildAudioManifest(audioTracks: AudioTrack[], fps: number): AudioManife
       path: source,
       startSec: alignedStart,
       endSec: alignedEnd,
-      gain: 1.0,
+      gain: 0.8,
     });
   }
 
   return manifest;
 }
 
-export async function runOfflineWebMExport(params: OfflineExportParams): Promise<{
-  blob: Blob;
+export async function runVideoExport(params: VideoExportParams): Promise<{
   duration: number;
   frameCount: number;
 }> {
@@ -92,7 +97,6 @@ export async function runOfflineWebMExport(params: OfflineExportParams): Promise
   const cache = await appCacheDir();
   const stamp = Date.now();
   const frameDir = await join(cache, `offline-frames-${stamp}`);
-  const outWebm = await join(cache, `offline-export-${stamp}.webm`);
   const pattern = "frame-%06d.png";
 
   await mkdir(frameDir, { recursive: true });
@@ -115,22 +119,23 @@ export async function runOfflineWebMExport(params: OfflineExportParams): Promise
       });
     }
 
-    const manifest = buildAudioManifest(params.audioTracks, safeFps);
-    await invoke("encode_png_sequence_to_webm_alpha", {
+    const manifest = params.includeAudio ? buildAudioManifest(params.audioTracks, safeFps) : [];
+    params.onProgress?.({ frameIndex: totalFrames, totalFrames, timeSec: totalFrames / safeFps });
+    await invoke("encode_png_sequence_to_video", {
       frameDir,
       pattern,
-      outWebm,
+      outputPath: params.outputPath,
+      format: params.format,
       fps: safeFps,
+      targetDurationSec: totalFrames / safeFps,
       audioManifestJson: manifest.length > 0 ? JSON.stringify(manifest) : null,
     });
 
-    const bytes = await readFile(outWebm);
     return {
-      blob: new Blob([bytes], { type: "video/webm" }),
       duration: totalFrames / safeFps,
       frameCount: totalFrames,
     };
   } finally {
-    try { await remove(frameDir, { recursive: true }); } catch {}
+    try { await remove(frameDir, { recursive: true }); } catch { /* 帧目录清理失败不阻断 */ }
   }
 }

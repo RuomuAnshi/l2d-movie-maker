@@ -21,8 +21,8 @@ type Props = {
 const MIN_CLIP_SEC = 0.1;
 const GRID_STEP_SEC = 0.1;
 const DEFAULT_PPS = 80;
-const TRACK_H = 62;
-const CLIP_H = 42;
+const TRACK_H = 48;
+const CLIP_H = 34;
 const HANDLE_W = 8;
 const RULER_H = 34;
 
@@ -32,11 +32,11 @@ type DragKind =
   | { mode: "playhead"; mouseX0: number; playhead0: number }
   | null;
 
-const trackConfig: Record<TrackKind, { label: string; sublabel: string; color: string }> = {
-  motion: { label: "动作轨", sublabel: "Motion", color: "#6b7aff" },
-  expr: { label: "表情轨", sublabel: "Expression", color: "#2fa38d" },
-  audio: { label: "音频轨", sublabel: "Audio", color: "#d7863f" },
-  subtitle: { label: "字幕轨", sublabel: "Subtitle", color: "#c96a6a" },
+const trackConfig: Record<TrackKind, { label: string; color: string }> = {
+  motion: { label: "动作轨", color: "#708a4b" },
+  expr: { label: "表情轨", color: "#5c8290" },
+  audio: { label: "音频轨", color: "#bd8043" },
+  subtitle: { label: "字幕轨", color: "#ad6551" },
 };
 
 function getAudioAudibleRatio(clip: Clip) {
@@ -70,7 +70,11 @@ export default function Timeline({
   const pps = typeof pixelsPerSec === "number" ? pixelsPerSec : internalPps;
   const setPps = (value: number) => {
     const next = Math.max(10, Math.min(800, Math.round(value)));
-    onChangePixelsPerSec ? onChangePixelsPerSec(next) : setInternalPps(next);
+    if (onChangePixelsPerSec) {
+      onChangePixelsPerSec(next);
+    } else {
+      setInternalPps(next);
+    }
   };
 
   const lengthSec = useMemo(
@@ -360,8 +364,7 @@ export default function Timeline({
     <div className="tl-root" ref={wrapRef}>
       <div className="tl-header">
         <div className="tl-header-copy">
-          <div className="tl-kicker">时间线</div>
-          <h3 className="tl-title">剪辑编排</h3>
+          <h3 className="tl-title">时间线</h3>
         </div>
         <div className="tl-toolbar">
           <button
@@ -405,25 +408,18 @@ export default function Timeline({
 
       <div className="tl-layout">
         <div className="tl-side">
-          <div className="tl-side-cell tl-side-cell--ruler">
-            <strong>时间尺</strong>
-            <span>Time</span>
-          </div>
+          <div className="tl-side-cell tl-side-cell--ruler" aria-hidden="true" />
           <div className="tl-side-cell">
             <strong>{trackConfig.motion.label}</strong>
-            <span>{trackConfig.motion.sublabel}</span>
           </div>
           <div className="tl-side-cell">
             <strong>{trackConfig.expr.label}</strong>
-            <span>{trackConfig.expr.sublabel}</span>
           </div>
           <div className="tl-side-cell">
             <strong>{trackConfig.audio.label}</strong>
-            <span>{trackConfig.audio.sublabel}</span>
           </div>
           <div className="tl-side-cell">
             <strong>{trackConfig.subtitle.label}</strong>
-            <span>{trackConfig.subtitle.sublabel}</span>
           </div>
         </div>
 
@@ -440,8 +436,7 @@ export default function Timeline({
               </>
             ) : (
               <div className="tl-empty">
-                <strong>时间线还是空的</strong>
-                <span>从左侧资源区把动作、表情或音频加入轨道，开始搭建镜头节奏。</span>
+                <strong>拖入资源开始编排</strong>
               </div>
             )}
           </div>

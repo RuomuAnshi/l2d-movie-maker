@@ -6,13 +6,13 @@ import {
   type ExtractCompositeSelectorsResult,
 } from "composite-model";
 import { Live2DModel } from "pixi-live2d-display";
+import {
+  normalizeModelData,
+  readModelDataFromRuntime,
+  withFallbackModelData,
+  type ModelData,
+} from "../utils/modelData";
 
-interface Motion { name: string; file: string; }
-interface Expression { name: string; file: string; }
-interface ModelData {
-  motions: { [key: string]: Motion[] };
-  expressions: Expression[];
-}
 type TransformSnapshot = {
   x: number;
   y: number;
@@ -69,11 +69,6 @@ export type JsonlLive2DModel = Live2DModel & {
   __compositeResolvedUrl?: string;
 };
 
-type ModelJsonLike = {
-  motions?: Record<string, Array<{ name?: string; file?: string }>>;
-  expressions?: Array<{ name?: string; file?: string }>;
-};
-
 interface ModelManagerProps {
   appRef: React.MutableRefObject<PIXI.Application | null>;
   modelRef: React.MutableRefObject<Live2DModel | Live2DModel[] | null>;
@@ -128,14 +123,14 @@ export default function ModelManager({
         if (groupContainerRef.current) {
           (groupContainerRef.current as DraggableCleanupTarget).__dragCleanup?.();
           groupContainerRef.current.removeChildren().forEach((child) => {
-            try { child.destroy?.({ children: true, texture: true, baseTexture: true }); } catch {}
+            try { child.destroy?.({ children: true, texture: true, baseTexture: true }); } catch { /* 已销毁的子节点忽略 */ }
           });
           app.stage.removeChild(groupContainerRef.current);
-          try { groupContainerRef.current.destroy?.({ children: true }); } catch {}
+          try { groupContainerRef.current.destroy?.({ children: true }); } catch { /* 已销毁的容器忽略 */ }
         }
       } else if (modelRef.current) {
         app.stage.removeChild(modelRef.current);
-        try { modelRef.current.destroy?.({ children: true, texture: true, baseTexture: true }); } catch {}
+        try { modelRef.current.destroy?.({ children: true, texture: true, baseTexture: true }); } catch { /* 已销毁的模型忽略 */ }
       }
       
       // 清理引用
@@ -194,24 +189,21 @@ export default function ModelManager({
     selectors: ExtractCompositeSelectorsResult,
     firstModelUrl: string,
   ): Promise<ModelData> => {
-    const firstModelJson = await (await fetch(firstModelUrl, { cache: "no-cache" })).json() as ModelJsonLike;
-    const fullMotions = firstModelJson.motions ?? {};
-    const motionsFiltered: Record<string, Motion[]> = {};
+    const firstModelJson = normalizeModelData(await (await fetch(firstModelUrl, { cache: "no-cache" })).json());
+    const fullMotions = firstModelJson.motions;
+    const motionsFiltered: ModelData["motions"] = {};
 
     for (const group of selectors.motions) {
       const entries = fullMotions[group] ?? [];
-      motionsFiltered[group] = entries.map((item, index) => ({
-        name: item?.name ?? `${group}-${index}`,
-        file: item?.file ?? "",
-      }));
+      if (entries.length > 0) {
+        motionsFiltered[group] = entries.map((item) => ({ name: item.name, file: item.file }));
+      }
     }
 
-    const fullExpressions = firstModelJson.expressions ?? [];
+    const fullExpressions = firstModelJson.expressions;
     const expressions = selectors.expressions.length > 0
-      ? fullExpressions
-        .filter((expression) => expression?.name && selectors.expressions.includes(expression.name))
-        .map((expression) => ({ name: expression.name ?? "", file: expression.file ?? "" }))
-      : fullExpressions.map((expression) => ({ name: expression?.name ?? "", file: expression?.file ?? "" }));
+      ? fullExpressions.filter((expression) => selectors.expressions.includes(expression.name))
+      : fullExpressions;
 
     return { motions: motionsFiltered, expressions };
   };
@@ -286,13 +278,12 @@ export default function ModelManager({
     container.addChild(hit);
 
     container.interactive = true;
-    // @ts-ignore: pixi v7 可用 eventMode
+    // @ts-expect-error pixi v7 兼容字段，v6 类型中不存在
     container.eventMode = "static";
     container.cursor = "grab";
 
     container.on("pointerdown", (e: PointerDataLike) => {
       setIsDragging(true);
-      // @ts-ignore
       container.cursor = "grabbing";
       container.dragging = true;
       container._pointerX = e.data.global.x - container.x;
@@ -337,7 +328,6 @@ export default function ModelManager({
 
     const up = () => {
       setIsDragging(false);
-      // @ts-ignore
       container.cursor = "grab";
       container.dragging = false;
       container._dragMode = undefined;
@@ -370,8 +360,8 @@ export default function ModelManager({
         throw new Error(`HTTP ${res.status}: ${res.statusText}`);
       }
       
-      const data = await res.json();
-      setModelData(data);
+      const normalized = normalizeModelData(await res.json());
+      setModelData(withFallbackModelData(normalized, readModelDataFromRuntime(model)));
 
       model.anchor.set(0.5, 0.5);
       model.scale.set(0.3);
@@ -477,10 +467,10 @@ export default function ModelManager({
 
       try {
         const synthesized = await synthesizeCompositeModelData(loaded.selectors, firstModelUrl);
-        setModelData(synthesized);
+        setModelData(withFallbackModelData(synthesized, readModelDataFromRuntime(firstModel)));
       } catch (error) {
         console.warn("Failed to synthesize composite modelData", error);
-        setModelData({ motions: {}, expressions: [] });
+        setModelData(readModelDataFromRuntime(firstModel) ?? { motions: {}, expressions: [] });
       }
 
       modelRef.current = children;
@@ -494,7 +484,7 @@ export default function ModelManager({
         try {
           appRef.current.stage.removeChild(groupContainerRef.current);
           groupContainerRef.current.destroy({ children: true });
-        } catch {}
+        } catch { /* 清理失败不阻断错误处理 */ }
       }
       groupContainerRef.current = null;
       modelRef.current = null;

@@ -11,6 +11,7 @@
     "fs:allow-appcache-read-recursive",
     "fs:allow-appcache-write-recursive",
     "fs:scope-appcache-recursive",
+    "fs:scope-appdata-recursive",
     
     "fs:read-all",
     "fs:write-all",

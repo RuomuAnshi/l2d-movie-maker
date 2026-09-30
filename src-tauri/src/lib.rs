@@ -27,15 +27,12 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         // 命令
         .invoke_handler(tauri::generate_handler![
-            crate::commands::media::vp9_to_prores4444,
-            crate::commands::media::mov_to_webm_alpha,
-            crate::commands::media::alpha_to_mp4_flatten,
-            crate::commands::media::encode_png_sequence_to_webm_alpha,
+            crate::commands::media::encode_png_sequence_to_video,
             crate::commands::models::find_live2d_models,
+            crate::commands::models::pick_model_source,
             crate::commands::server::get_model_server_info,
             crate::commands::server::register_external_asset_root,
             crate::commands::server::refresh_model_index,
-            crate::commands::media::set_fs_scope,
             crate::commands::webgal::webgal_path_exists,
             crate::commands::webgal::webgal_read_text_file,
             crate::commands::webgal::validate_webgal_project_dir,

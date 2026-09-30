@@ -6,27 +6,41 @@ import Timeline from "./timeline/Timeline";
 import type { Clip, SubtitleClip, TrackKind } from "./timeline/clipTypes";
 import { parseMotionDurationSeconds } from "../utils/motionDuration";
 import "./Live2DView.css";
+import "./pixel-theme.css";
 import ControlPanel, { type InspectorTab } from "./panel/ControlPanel";
 import ModelManager from "./ModelManager";
 import type { JsonlLive2DModel } from "./ModelManager";
 import AudioManager from "./AudioManager";
-import RecordingManager from "./RecordingManager";
+import ScreenshotManager from "./ScreenshotManager";
 import WebGALMode from "./WebGALMode";
 import AlertModal from "./AlertModal";
 // import { convertFileSrc } from "@tauri-apps/api/core";
 // import { normalizePath } from "../utils/fs";
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import { appCacheDir, BaseDirectory, join } from "@tauri-apps/api/path";
-import { writeFile } from "@tauri-apps/plugin-fs";
-import { isVp9AlphaSupported } from "../utils/recorder";
-import { runOfflineWebMExport } from "../utils/offlineExporter";
+import { dirname, join } from "@tauri-apps/api/path";
+import { remove, writeFile } from "@tauri-apps/plugin-fs";
+import { runVideoExport, type VideoExportFormat, type VideoExportMode } from "../utils/videoExporter";
 import {
   buildWebGALExternalAssetUrl,
   loadWebGALMotionDurations,
   resolveFigureAbsolutePath,
   type WebGALImportPlan,
 } from "../utils/webgalProject";
+import {
+  importModelSource,
+  loadModelPackages,
+  saveModelPackages,
+  type ModelPackage,
+} from "../utils/modelLibrary";
+import {
+  createProjectBundle,
+  loadAutosaveProject,
+  openProjectBundle,
+  saveAutosaveProject,
+  storeAudioAsset,
+  type ProjectSnapshot,
+} from "../utils/projectStorage";
 
 interface Motion { name: string; file: string; }
 interface Expression { name: string; file: string; }
@@ -40,14 +54,12 @@ type CharacterOption = { id: string; label: string };
 type CharacterTransform = { x: number; y: number; scaleX: number; scaleY: number; rotation: number };
 type CharacterTransformMode = "single-relative" | "composite-container";
 type TransformTarget = Pick<PIXI.Container, "position" | "scale" | "rotation" | "getBounds">;
-type BoundsTarget = Pick<Live2DModel, "width" | "height" | "position" | "scale" | "getBounds" | "getLocalBounds">;
 type RendererWithBackground = PIXI.Renderer & {
   backgroundColor: number;
   backgroundAlpha: number;
   clearBeforeRender: boolean;
   gl?: WebGLRenderingContext | WebGL2RenderingContext | null;
 };
-type ExportVisualMode = "all" | "subtitle-only" | "live2d-only";
 type SubtitleSpeakerAlign = "left" | "center" | "right";
 const PLAYHEAD_UI_INTERVAL_MS = 1000 / 30;
 const EXPORT_PROGRESS_UI_INTERVAL_MS = 100;
@@ -85,6 +97,11 @@ export default function Live2DView() {
 
   // ??????? ???//
   const [modelList, setModelList] = useState<string[]>([]);
+  const [modelRoot, setModelRoot] = useState<string | null>(null);
+  const [modelPackages, setModelPackages] = useState<ModelPackage[]>([]);
+  const [isImportingModel, setIsImportingModel] = useState(false);
+  const [projectHydrated, setProjectHydrated] = useState(false);
+  const [lastAutosaveAt, setLastAutosaveAt] = useState<Date | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(null); // ?? "anon/model.json" ??"xxx/model.jsonl"
   const [, setExternalModelDisplayName] = useState<string | null>(null);
   const modelUrl = selectedModel && assetBase ? `${assetBase}/${selectedModel}` : null; // ???URL
@@ -129,12 +146,10 @@ export default function Live2DView() {
   const [motionLen, setMotionLen] = useState<MotionLenMap>({});
 
   // ????? ???//
-  const [recState, setRecState] = useState<"idle" | "rec" | "done" | "offline">("idle");
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [recordingProgress, setRecordingProgress] = useState(0);
+  const [exportState, setExportState] = useState<"idle" | "done" | "exporting">("idle");
+  const [exportTime, setExportTime] = useState(0);
+  const [exportProgress, setExportProgress] = useState(0);
   const [transparentBg, setTransparentBg] = useState(true);
-  const [blob, setBlob] = useState<Blob | null>(null);
-  const [blobDefaultName, setBlobDefaultName] = useState("export.webm");
   
   // ????????????????//
   const [customRecordingBounds, setCustomRecordingBounds] = useState({ x: 0, y: 0, width: 800, height: 600 });
@@ -834,7 +849,8 @@ export default function Live2DView() {
       const audioPath = Array.isArray(picked) ? picked[0] : picked;
       if (!audioPath) return;
 
-      const audioUrl = convertFileSrc(audioPath);
+      const managedAudioPath = await storeAudioAsset(audioPath);
+      const audioUrl = await buildWebGALExternalAssetUrl(await dirname(managedAudioPath), managedAudioPath);
       const audio = new Audio(audioUrl);
       audio.crossOrigin = "anonymous";
       await new Promise((resolve, reject) => {
@@ -859,7 +875,7 @@ export default function Live2DView() {
         duration,
         audioSourceDuration: duration,
         audioUrl,
-        audioPath
+        audioPath: managedAudioPath
       };
 
       const audioMeta = await analyzeAudioSource(audioUrl, duration);
@@ -876,6 +892,15 @@ export default function Live2DView() {
   };
 
   const timelineLength = Math.max(nextEnd(motionClips), nextEnd(exprClips), nextEnd(audioClips), nextEnd(subtitleClips));
+
+  useEffect(() => {
+    if (!projectHydrated) return;
+    for (const clip of audioClips) {
+      if (clip.audioUrl && !audioManager.audioRefs.current.has(clip.id)) {
+        registerAudioElement(clip.id, clip.audioUrl);
+      }
+    }
+  }, [projectHydrated, audioClips]);
 
   const applyTimelineAtTime = (t: number, offline: boolean = false) => {
     const activeMotionClip = findActiveClip(motionClips, t);
@@ -928,19 +953,6 @@ export default function Live2DView() {
     renderer.backgroundColor = 0xf0f0f0;
     renderer.backgroundAlpha = 1;
     renderer.clearBeforeRender = false;
-  };
-
-  const applyBoundsFromModelMetrics = (model: BoundsTarget) => {
-    const modelWidth = model.width * model.scale.x;
-    const modelHeight = model.height * model.scale.y;
-    const modelX = model.position.x - modelWidth / 2;
-    const modelY = model.position.y - modelHeight / 2;
-    setCustomRecordingBounds({
-      x: Math.max(0, modelX),
-      y: Math.max(0, modelY),
-      width: Math.max(100, Math.min(modelWidth, window.innerWidth)),
-      height: Math.max(100, Math.min(modelHeight, window.innerHeight)),
-    });
   };
 
   const syncPlayheadUi = (nextPlayhead: number, ts: number, force: boolean = false) => {
@@ -1034,16 +1046,6 @@ export default function Live2DView() {
     };
   }, []);
 
-  // ??????
-  const startRecording = () => {
-    setBlobDefaultName("export.webm");
-    recordingManager.start();
-  };
-
-  const stopRecording = () => {
-    recordingManager.stop();
-  };
-
   const formatSrtTimestamp = (timeSec: number) => {
     const totalMs = Math.max(0, Math.round(timeSec * 1000));
     const hours = Math.floor(totalMs / 3_600_000);
@@ -1081,9 +1083,13 @@ export default function Live2DView() {
     await writeFile(out, new TextEncoder().encode(content));
   };
 
-  const startOfflineExport = async (mode: ExportVisualMode = "all") => {
+  const exportVideo = async (
+    format: VideoExportFormat,
+    mode: VideoExportMode,
+    includeAudio: boolean,
+  ) => {
     if (!canvasRef.current || !appRef.current) return;
-    if (recState === "rec" || recState === "offline") return;
+    if (exportState === "exporting") return;
 
     if (mode === "subtitle-only" && subtitleClips.length === 0) {
       showAlert("当前没有可导出的字幕轨内容");
@@ -1111,10 +1117,30 @@ export default function Live2DView() {
     const settings = qualitySettings[recordingQuality];
     const targetFrames = Math.max(1, Math.ceil(totalDuration * settings.fps));
 
-    const blobOnlyAudio = audioClips.filter(c => c.audioUrl && !c.audioPath && /^blob:/i.test(c.audioUrl));
+    const blobOnlyAudio = includeAudio
+      ? audioClips.filter(c => c.audioUrl && !c.audioPath && /^blob:/i.test(c.audioUrl))
+      : [];
     if (blobOnlyAudio.length > 0) {
-      showAlert("错误: 存在 blob 音频无法直接导出");
+      showAlert(`有 ${blobOnlyAudio.length} 条临时音频无法导出，请重新导入音频文件`);
+      return;
     }
+
+    const baseName = mode === "subtitle-only" ? "subtitles-only" : mode === "live2d-only" ? "live2d-only" : "export";
+    let selectedPath: string | null;
+    try {
+      selectedPath = await save({
+        defaultPath: `${baseName}.${format}`,
+        filters: [{ name: format === "webm" ? "WebM" : "MOV", extensions: [format] }],
+      });
+    } catch (error) {
+      showAlert("无法选择导出位置: " + String(error));
+      return;
+    }
+    if (!selectedPath) return;
+    const hasExtension = /\.[^./\\]+$/.test(selectedPath);
+    const outputPath = hasExtension
+      ? selectedPath.replace(/\.[^./\\]+$/, `.${format}`)
+      : `${selectedPath}.${format}`;
 
     const hasValidBounds = customRecordingBounds && customRecordingBounds.width > 0 && customRecordingBounds.height > 0;
     const shouldUseModelFrame = hasValidBounds && useModelFrame;
@@ -1127,9 +1153,9 @@ export default function Live2DView() {
       exportCtx = exportCanvas.getContext('2d');
     }
 
-    setRecState('offline');
-    setRecordingTime(0);
-    setRecordingProgress(0);
+    setExportState('exporting');
+    setExportTime(0);
+    setExportProgress(0);
     stopPlayback();
 
     const app = appRef.current;
@@ -1138,7 +1164,7 @@ export default function Live2DView() {
     let prepInterval: number | null = null;
     let firstFrame = false;
     const prepStart = Date.now();
-    let offlineTickerTimeMs = performance.now();
+    let exportTickerTimeMs = performance.now();
     let lastExportProgressUiTs = 0;
     const previousModelVisibility = getModelVisibilitySnapshot();
     const previousSubtitleOverride = subtitleVisibilityOverrideRef.current;
@@ -1146,27 +1172,24 @@ export default function Live2DView() {
     if (mode === "subtitle-only") {
       setModelVisibility(false);
       subtitleVisibilityOverrideRef.current = true;
-      setBlobDefaultName("subtitles-only.webm");
     } else if (mode === "live2d-only") {
       setModelVisibility(true);
       subtitleVisibilityOverrideRef.current = false;
-      setBlobDefaultName("live2d-only.webm");
     } else {
       setModelVisibility(true);
       subtitleVisibilityOverrideRef.current = null;
-      setBlobDefaultName("export.webm");
     }
     renderSubtitleClip(findActiveClip(subtitleClips, playheadRef.current) as SubtitleClip | null);
 
-    const updateOfflineExportUi = (timeSec: number, progressPct: number, force: boolean = false) => {
+    const updateExportUi = (timeSec: number, progressPct: number, force: boolean = false) => {
       const now = performance.now();
       if (!force && now - lastExportProgressUiTs < EXPORT_PROGRESS_UI_INTERVAL_MS) {
         return;
       }
       lastExportProgressUiTs = now;
       startTransition(() => {
-        setRecordingTime(timeSec);
-        setRecordingProgress(progressPct);
+        setExportTime(timeSec);
+        setExportProgress(progressPct);
       });
     };
 
@@ -1175,17 +1198,19 @@ export default function Live2DView() {
         if (firstFrame) return;
         const elapsed = (Date.now() - prepStart) / 1000;
         const pct = Math.min(0.05, elapsed * 0.2);
-        updateOfflineExportUi(elapsed, pct * 100);
+        updateExportUi(elapsed, pct * 100);
       }, 100);
-      const result = await runOfflineWebMExport({
+      await runVideoExport({
         canvas: exportCanvas,
+        outputPath,
+        format,
         fps: settings.fps,
         targetFrameCount: targetFrames,
         applyTimelineAtTime: (timeSec) => applyTimelineAtTime(timeSec, true),
         renderFrame: () => {
-          offlineTickerTimeMs += 1000 / settings.fps;
+          exportTickerTimeMs += 1000 / settings.fps;
           // Application already binds render() to ticker, so one ticker update is enough.
-          app.ticker.update(offlineTickerTimeMs);
+          app.ticker.update(exportTickerTimeMs);
           if (exportCtx) {
             if (transparentBg) {
               exportCtx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
@@ -1211,29 +1236,29 @@ export default function Live2DView() {
           audioUrl: c.audioUrl,
           audioPath: c.audioPath
         })),
+        includeAudio,
         onProgress: ({ frameIndex, totalFrames, timeSec }) => {
           if (!firstFrame) {
             firstFrame = true;
             if (prepInterval) { clearInterval(prepInterval); prepInterval = null; }
           }
-          updateOfflineExportUi(
+          updateExportUi(
             timeSec,
-            (frameIndex / totalFrames) * 100,
+            Math.min(85, (frameIndex / totalFrames) * 85),
             frameIndex >= totalFrames,
           );
         }
       });
 
-      setBlob(result.blob);
-      setRecState('done');
-      setRecordingTime(0);
-      setRecordingProgress(0);
+      setExportState('done');
+      setExportTime(0);
+      setExportProgress(0);
     } catch (error) {
-      console.error('离线导出失败:', error);
-      showAlert("离线导出失败: " + String(error));
-      setRecState('idle');
-      setRecordingTime(0);
-      setRecordingProgress(0);
+      console.error('视频导出失败:', error);
+      showAlert("视频导出失败: " + String(error));
+      setExportState('idle');
+      setExportTime(0);
+      setExportProgress(0);
     } finally {
       restoreModelVisibility(previousModelVisibility);
       subtitleVisibilityOverrideRef.current = previousSubtitleOverride;
@@ -1242,50 +1267,8 @@ export default function Live2DView() {
       if (wasTickerStarted) app.ticker.start();
     }
   };
-  void startOfflineExport;
 
-  const recordingManager = RecordingManager({
-    canvasRef,
-    modelRef,
-    motionClips,
-    exprClips,
-    audioClips,
-    subtitleClips,
-    recordingQuality,
-    customRecordingBounds,
-    useModelFrame,
-    setRecState,
-    setRecordingTime,
-    setRecordingProgress,
-    setBlob,
-    prepareAudioRecording: async () => {
-      await audioManager.resumeAudioContext();
-      return audioManager.recordingDestinationRef.current?.stream ?? null;
-    },
-    startPlayback,
-    stopPlayback,
-    showAlert
-  });
-
-  const saveWebM = async () => {
-    if (!blob) return;
-    const out = await save({
-      defaultPath: blobDefaultName,
-      filters: [{ name: "WebM", extensions: ["webm"] }],
-    });
-    if (!out) return;
-    await writeFile(out, new Uint8Array(await blob.arrayBuffer()));
-  };
-
-  const toMov = async () => {
-    if (!blob) return;
-    const name = `alpha-${Date.now()}.webm`;
-    await writeFile(name, new Uint8Array(await blob.arrayBuffer()), { baseDir: BaseDirectory.AppCache });
-    const abs = await join(await appCacheDir(), name);
-    const out = await save({ defaultPath: "export-4444.mov", filters: [{ name: "MOV", extensions: ["mov"] }] });
-    if (!out) return;
-    await invoke("vp9_to_prores4444", { inWebm: abs, outMov: out });
-  };
+  const screenshotManager = ScreenshotManager({ canvasRef, modelRef, showAlert });
 
   // ??WebGAL??????
   const exitWebGALMode = () => {
@@ -1391,7 +1374,8 @@ export default function Live2DView() {
 
         if (group.audioAbsolutePath) {
           const clipId = crypto.randomUUID();
-          const audioUrl = await buildWebGALExternalAssetUrl(plan.projectRoot, group.audioAbsolutePath);
+          const managedAudioPath = await storeAudioAsset(group.audioAbsolutePath);
+          const audioUrl = await buildWebGALExternalAssetUrl(await dirname(managedAudioPath), managedAudioPath);
           createImportedAudioElement(clipId, audioUrl);
           const audioMeta = await analyzeAudioSource(audioUrl, group.audioDurationSec ?? duration);
           nextAudioClips.push({
@@ -1401,7 +1385,7 @@ export default function Live2DView() {
             duration,
             audioSourceDuration: audioMeta.audioSourceDuration,
             audioUrl,
-            audioPath: group.audioAbsolutePath,
+            audioPath: managedAudioPath,
             waveformPeaks: audioMeta.waveformPeaks,
           });
           linkedAudioClipId = clipId;
@@ -1442,52 +1426,14 @@ export default function Live2DView() {
   };
 
 
-  // ????????- ?? getBounds() ??????????
-  const resetToModelBounds = () => {
-    void resetToModelBounds;
-    if (!appRef.current) return;
-
-    if (modelRef.current) {
-      if (Array.isArray(modelRef.current)) {
-        // ???? - ??????getBounds
-        if (groupContainerRef.current) {
-          const b = groupContainerRef.current.getBounds();
-          setCustomRecordingBounds({
-            x: Math.max(0, b.x),
-            y: Math.max(0, b.y),
-            width: Math.max(100, Math.min(b.width, window.innerWidth)),
-            height: Math.max(100, Math.min(b.height, window.innerHeight)),
-          });
-        }
-      } else {
-        // ????- ?? getBounds() ????????
-        const model = modelRef.current;
-        try {
-          // ???? getBounds ????????
-          const b = model.getBounds() || model.getLocalBounds();
-          if (b && b.width > 0 && b.height > 0) {
-            setCustomRecordingBounds({
-              x: Math.max(0, b.x),
-              y: Math.max(0, b.y),
-              width: Math.max(100, Math.min(b.width, window.innerWidth)),
-              height: Math.max(100, Math.min(b.height, window.innerHeight)),
-            });
-          } else {
-            applyBoundsFromModelMetrics(model);
-          }
-        } catch (e) {
-          applyBoundsFromModelMetrics(model);
-        }
-      }
-    }
-  };
-
   useEffect(() => {
     (async () => {
       try {
         // ??Rust????http://127.0.0.1:PORT/model
-        const { base_url } = await invoke<{base_url: string, models_dir: string}>("get_model_server_info");
+        const { base_url, models_dir } = await invoke<{base_url: string, models_dir: string}>("get_model_server_info");
         setAssetBase(base_url);
+        setModelRoot(models_dir);
+        setModelPackages(await loadModelPackages());
       } catch (e) {
         console.error("????????????", e);
         setAssetBase(null);
@@ -1503,10 +1449,9 @@ export default function Live2DView() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const arr = (await res.json()) as string[];
       setModelList(arr);
-      // ??????????????
-      setSelectedModel(prev => prev ?? arr[0] ?? null);
+      setSelectedModel((prev) => (prev && arr.includes(prev) ? prev : arr[0] ?? null));
     } catch (e) {
-      console.warn("???? models.json ?????? exe ????model/models.json ??", e);
+      console.warn("读取模型库索引失败", e);
       setModelList([]);
       setSelectedModel(null);
     }
@@ -1515,6 +1460,13 @@ export default function Live2DView() {
   useEffect(() => {
     loadModelList();
   }, [assetBase]);
+
+  useEffect(() => {
+    if (!projectHydrated || modelList.length === 0) return;
+    if (!selectedModel || !modelList.includes(selectedModel)) {
+      setSelectedModel(modelList[0]);
+    }
+  }, [projectHydrated, modelList, selectedModel]);
 
   // ??????
   const refreshModels = async () => {
@@ -1526,6 +1478,197 @@ export default function Live2DView() {
       }
     } catch (e) {
       console.error("????????:", e);
+    }
+  };
+
+  const importModel = async (pickFolder = false) => {
+    if (!modelRoot) {
+      showAlert("模型库尚未初始化，请稍后再试。");
+      return;
+    }
+    setIsImportingModel(true);
+    try {
+      const selectedPath = await invoke<string | null>("pick_model_source", { directory: pickFolder });
+      if (typeof selectedPath !== "string") return;
+      const imported = await importModelSource(selectedPath, modelRoot);
+      const nextModelList = await invoke<string[]>("refresh_model_index");
+      const importedPaths = nextModelList.filter((path) => path.startsWith(`${imported.id}/`));
+      if (importedPaths.length === 0) {
+        await remove(await join(modelRoot, imported.id), { recursive: true });
+        throw new Error("未在所选资源中发现有效的 Live2D 模型配置文件。请导入包含 .model.json、.model3.json 或 .jsonl 的文件夹/压缩包。");
+      }
+      const nextPackages = [...modelPackages, { ...imported, modelPaths: importedPaths }];
+      await saveModelPackages(nextPackages);
+      setModelPackages(nextPackages);
+      setModelList(nextModelList);
+      setSelectedModel(importedPaths[0]);
+    } catch (error) {
+      console.error("导入模型失败", error);
+      showAlert(`导入失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setIsImportingModel(false);
+    }
+  };
+
+  const deleteModelPackage = async (id: string) => {
+    const target = modelPackages.find((item) => item.id === id);
+    if (!target || !modelRoot) return;
+    if (!window.confirm(`确定从模型库移除“${target.name}”及其资源吗？`)) return;
+    try {
+      await remove(await join(modelRoot, id), { recursive: true });
+      const nextPackages = modelPackages.filter((item) => item.id !== id);
+      await saveModelPackages(nextPackages);
+      setModelPackages(nextPackages);
+      const nextModelList = await invoke<string[]>("refresh_model_index");
+      setModelList(nextModelList);
+      if (selectedModel && target.modelPaths.includes(selectedModel)) {
+        setSelectedModel(nextModelList[0] ?? null);
+      }
+    } catch (error) {
+      showAlert(`移除模型失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const makeProjectSnapshot = (): ProjectSnapshot => ({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    selectedModel,
+    selectedCharacterId,
+    motionClips,
+    exprClips,
+    audioClips: audioClips.map(({ audioBuffer: _audioBuffer, audioUrl: _audioUrl, ...clip }) => clip),
+    subtitleClips: subtitleClips.map(({ audioBuffer: _audioBuffer, audioUrl: _audioUrl, ...clip }) => clip),
+    showSubtitles,
+    showSubtitleSpeaker,
+    subtitleSpeakerAlign,
+    playhead: playheadRef.current,
+    motionDur,
+    exprDur,
+    characterVisible: isCharacterVisible,
+    characterTransformMode,
+    characterTransform,
+    recordingQuality,
+    transparentBg,
+    customRecordingBounds,
+  });
+
+  const applyProjectSnapshot = async (snapshot: ProjectSnapshot) => {
+    const restoredAudio = await Promise.all(snapshot.audioClips.map(async (clip) => {
+      let audioUrl: string | undefined;
+      if (clip.audioPath) {
+        try {
+          audioUrl = await buildWebGALExternalAssetUrl(await dirname(clip.audioPath), clip.audioPath);
+        } catch (error) {
+          console.warn(`恢复音频“${clip.name}”失败`, error);
+        }
+      }
+      return { ...clip, audioUrl };
+    }));
+    setSelectedModel(snapshot.selectedModel);
+    setSelectedCharacterId(snapshot.selectedCharacterId);
+    setMotionClips(snapshot.motionClips);
+    setExprClips(snapshot.exprClips);
+    setAudioClips(restoredAudio);
+    setSubtitleClips(snapshot.subtitleClips);
+    setShowSubtitles(snapshot.showSubtitles);
+    setShowSubtitleSpeaker(snapshot.showSubtitleSpeaker);
+    setSubtitleSpeakerAlign(snapshot.subtitleSpeakerAlign);
+    setMotionDur(snapshot.motionDur);
+    setExprDur(snapshot.exprDur);
+    setIsCharacterVisible(snapshot.characterVisible);
+    characterTransformModeRef.current = snapshot.characterTransformMode;
+    setCharacterTransformMode(snapshot.characterTransformMode);
+    characterTransformRef.current = snapshot.characterTransform;
+    setCharacterTransform(snapshot.characterTransform);
+    setRecordingQuality(snapshot.recordingQuality);
+    setTransparentBg(snapshot.transparentBg);
+    setCustomRecordingBounds(snapshot.customRecordingBounds);
+    setPlayheadSec(snapshot.playhead);
+    setCurrentMotion("");
+    setCurrentExpression("default");
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const snapshot = await loadAutosaveProject();
+        if (snapshot && !cancelled) {
+          await applyProjectSnapshot(snapshot);
+          if (snapshot.savedAt) setLastAutosaveAt(new Date(snapshot.savedAt));
+        }
+      } catch (error) {
+        console.warn("恢复自动保存工程失败", error);
+      } finally {
+        if (!cancelled) setProjectHydrated(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!projectHydrated) return;
+    const snapshot = makeProjectSnapshot();
+    const timer = window.setTimeout(() => {
+      void saveAutosaveProject(snapshot)
+        .then(() => setLastAutosaveAt(new Date()))
+        .catch((error) => console.warn("自动保存工程失败", error));
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [
+    projectHydrated,
+    selectedModel,
+    selectedCharacterId,
+    motionClips,
+    exprClips,
+    audioClips,
+    subtitleClips,
+    showSubtitles,
+    showSubtitleSpeaker,
+    subtitleSpeakerAlign,
+    motionDur,
+    exprDur,
+    isCharacterVisible,
+    characterTransformMode,
+    characterTransform,
+    recordingQuality,
+    transparentBg,
+    customRecordingBounds,
+    isPlaying,
+  ]);
+
+  const saveWorkspaceProject = async () => {
+    try {
+      const path = await save({
+        title: "保存 Live2D 工程",
+        defaultPath: "Live2D 工程.l2dproject",
+        filters: [{ name: "Live2D 工程", extensions: ["l2dproject"] }],
+      });
+      if (!path) return;
+      await writeFile(path, await createProjectBundle(makeProjectSnapshot()));
+      showAlert("工程已保存。工程包包含时间线和音频，模型仍引用本机模型库中的资源。");
+    } catch (error) {
+      showAlert(`保存工程失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const openWorkspaceProject = async () => {
+    try {
+      const path = await open({
+        multiple: false,
+        title: "打开 Live2D 工程",
+        filters: [{ name: "Live2D 工程", extensions: ["l2dproject"] }],
+      });
+      if (typeof path !== "string") return;
+      const snapshot = await openProjectBundle(path);
+      await applyProjectSnapshot(snapshot);
+      await saveAutosaveProject(snapshot);
+      setLastAutosaveAt(new Date());
+      if (snapshot.selectedModel && modelList.length > 0 && !modelList.includes(snapshot.selectedModel)) {
+        showAlert("工程已打开，但引用的模型不在当前模型库。请先导入对应模型，再从顶部选择它。");
+      }
+    } catch (error) {
+      showAlert(`打开工程失败：${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
@@ -1649,7 +1792,7 @@ export default function Live2DView() {
       if (appRef.current) {
         try {
           appRef.current.destroy(true, { children: true, texture: true, baseTexture: true });
-        } catch {}
+        } catch { /* 应用销毁失败不阻断清理 */ }
         appRef.current = null;
       }
       subtitleContainerRef.current = null;
@@ -1818,6 +1961,18 @@ export default function Live2DView() {
       setSelectedModel(rel || null);
     },
     onRefreshModels: refreshModels,
+    modelPackages,
+    isImportingModel,
+    onImportModel: () => void importModel(false),
+    onImportModelFolder: () => void importModel(true),
+    onDeleteModelPackage: (id: string) => void deleteModelPackage(id),
+    onSaveProject: () => void saveWorkspaceProject(),
+    onOpenProject: () => void openWorkspaceProject(),
+    autosaveStatus: !projectHydrated
+      ? "正在读取工程…"
+      : lastAutosaveAt
+        ? `已保存 ${lastAutosaveAt.toLocaleTimeString()}`
+        : "自动恢复已启用",
     modelData,
     motionLen,
     currentMotion,
@@ -1870,26 +2025,23 @@ export default function Live2DView() {
     setRecordingQuality,
     transparentBg,
     setTransparentBg,
-    recState,
-    recordingTime,
-    recordingProgress,
-    blob,
-    onStartRecording: startRecording,
-    onStopRecording: stopRecording,
-    onSaveWebM: saveWebM,
-    onConvertToMov: toMov,
+    exportState,
+    exportTime,
+    exportProgress,
+    onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => {
+      void exportVideo(format, mode, includeAudio);
+    },
     onExportSubtitlesSrt: exportSubtitlesSrt,
-    onTakeScreenshot: () => recordingManager.takeScreenshot(),
-    onTakePartsScreenshots: () => recordingManager.takePartsScreenshots(),
-    isVp9AlphaSupported,
+    onTakeScreenshot: () => screenshotManager.takeScreenshot(),
+    onTakePartsScreenshots: () => screenshotManager.takePartsScreenshots(),
   };
 
   return (
     <div className="editor-shell">
       <header className="editor-topbar">
         <div className="editor-topbar-brand">
-          <div className="editor-topbar-kicker">Live2D Movie Maker</div>
-          <h1>桌面工作区</h1>
+          <div className="editor-topbar-kicker">像素工坊 · LIVE2D MOVIE MAKER</div>
+          <h1>Live2D 工作台</h1>
         </div>
 
         <div className="editor-topbar-main">
@@ -1914,17 +2066,13 @@ export default function Live2DView() {
 
           <div className="topbar-button-group">
             <button className="btn btn--quiet" onClick={refreshModels}>
-              刷新模型
+              刷新
+            </button>
+            <button className="btn btn--accent" onClick={() => void importModel(false)} disabled={isImportingModel}>
+              {isImportingModel ? "导入中…" : "＋ 导入模型"}
             </button>
             <button className={`btn ${isPlaying ? "btn--accent" : "btn--primary"}`} onClick={isPlaying ? stopPlayback : startPlayback} disabled={!timelineLength && !isPlaying}>
               {isPlaying ? "停止播放" : "开始播放"}
-            </button>
-            <button
-              className={`btn ${recState === "rec" ? "btn--danger" : "btn--accent"}`}
-              onClick={recState === "rec" ? stopRecording : startRecording}
-              disabled={recState === "offline"}
-            >
-              {recState === "rec" ? "停止录制" : "录制 WebM"}
             </button>
             <button className="btn btn--quiet" onClick={addAudioClip}>
               导入音频
@@ -1956,8 +2104,17 @@ export default function Live2DView() {
 
               {!selectedModel ? (
                 <div className="monitor-empty">
-                  <strong>先加载一个 Live2D 模型</strong>
-                  <span>在顶部或左侧资源区选择模型，然后开始预览、编排和导出。</span>
+                  <span className="monitor-empty-mark" aria-hidden="true">✦</span>
+                  <strong>准备好你的第一个角色</strong>
+                  <span>导入模型文件夹、ZIP 压缩包或模型配置文件，即可开始编排。</span>
+                  <div className="monitor-empty-actions">
+                    <button className="btn btn--accent" onClick={() => void importModel(false)} disabled={isImportingModel}>
+                      选择模型文件 / ZIP
+                    </button>
+                    <button className="btn btn--quiet" onClick={() => void importModel(true)} disabled={isImportingModel}>
+                      选择模型文件夹
+                    </button>
+                  </div>
                 </div>
               ) : null}
 

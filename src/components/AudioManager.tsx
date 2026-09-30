@@ -15,6 +15,18 @@ interface AudioManagerProps {
   setCurrentAudioLevel: (level: number) => void;
 }
 
+type WebkitAudioWindow = Window & { webkitAudioContext?: typeof AudioContext };
+
+type Live2DInternalModelAccess = {
+  parameters?: {
+    count: number;
+    get: (key: string | number) => { id?: string; value?: number } | undefined;
+  };
+  coreModel?: {
+    setParamFloat?: (id: string, value: number) => void;
+  };
+};
+
 export default function AudioManager({
   modelRef,
   audioClips,
@@ -42,7 +54,11 @@ export default function AudioManager({
     let createdRecordingDestination = false;
     if (!audioContextRef.current) {
       try {
-        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const AudioContextCtor = window.AudioContext ?? (window as WebkitAudioWindow).webkitAudioContext;
+        if (!AudioContextCtor) {
+          throw new Error("当前环境不支持 AudioContext");
+        }
+        audioContextRef.current = new AudioContextCtor();
         recordingDestinationRef.current = audioContextRef.current.createMediaStreamDestination();
         createdRecordingDestination = true;
       } catch (error) {
@@ -59,7 +75,7 @@ export default function AudioManager({
       audioAnalyzersRef.current.forEach(({ analyzer }) => {
         try {
           analyzer.connect(recordingDestinationRef.current!);
-        } catch {}
+        } catch { /* 已连接时忽略 */ }
       });
     }
   };
@@ -86,7 +102,7 @@ export default function AudioManager({
       try {
         existingAnalyzer.source.disconnect();
         existingAnalyzer.analyzer.disconnect();
-      } catch {}
+      } catch { /* 已断开时忽略 */ }
       audioAnalyzersRef.current.delete(clipId);
     }
 
@@ -128,7 +144,7 @@ export default function AudioManager({
       try {
         analyzerData.source.disconnect();
         analyzerData.analyzer.disconnect();
-      } catch {}
+      } catch { /* 已断开时忽略 */ }
       audioAnalyzersRef.current.delete(clipId);
     }
   };
@@ -146,8 +162,8 @@ export default function AudioManager({
     
     try {
       forEachModel((model) => {
-        // 获取模型的内部模�?
-        const internalModel = (model as any).internalModel;
+        // 获取模型的内部模型
+        const internalModel = (model as unknown as { internalModel?: Live2DInternalModelAccess }).internalModel;
         if (!internalModel) {
           return;
         }
@@ -156,7 +172,8 @@ export default function AudioManager({
         let paramFound = false;
         
         // 方式1: 通过 parameters.get()
-        if (internalModel.parameters) {
+        const parameters = internalModel.parameters;
+        if (parameters) {
           const mouthParams = [
             'ParamMouthOpenY', 'ParamMouthForm', 'ParamMouthOpen',
             'ParamMouthA', 'ParamMouthI', 'ParamMouthU', 'ParamMouthE', 'ParamMouthO',
@@ -166,20 +183,21 @@ export default function AudioManager({
           
           mouthParams.forEach(paramName => {
             try {
-              const param = internalModel.parameters.get(paramName);
+              const param = parameters.get(paramName);
               if (param && typeof param.value !== 'undefined') {
                 const mouthValue = Math.min(1.0, Math.max(0.0, audioLevel / 100));
                 param.value = mouthValue;
                 paramFound = true;
               }
-            } catch (error) {
-              // 忽略错误，继续尝试下一个参�?
+            } catch {
+              // 忽略错误，继续尝试下一个参数
             }
           });
         }
         
         // 方式2: 通过 coreModel.setParamFloat()
-        if (internalModel.coreModel && !paramFound) {
+        const coreModel = internalModel.coreModel;
+        if (coreModel && !paramFound) {
           const mouthParams = [
             'PARAM_MOUTH_OPEN_Y', 'PARAM_MOUTH_FORM', 'PARAM_MOUTH_OPEN',
             'PARAM_MOUTH_A', 'PARAM_MOUTH_I', 'PARAM_MOUTH_U', 'PARAM_MOUTH_E', 'PARAM_MOUTH_O'
@@ -188,20 +206,20 @@ export default function AudioManager({
           mouthParams.forEach(paramName => {
             try {
               const mouthValue = Math.min(1.0, Math.max(0.0, audioLevel / 100));
-              internalModel.coreModel.setParamFloat(paramName, mouthValue);
+              coreModel.setParamFloat?.(paramName, mouthValue);
               paramFound = true;
-            } catch (error) {
-              // 忽略错误，继续尝试下一个参�?
+            } catch {
+              // 忽略错误，继续尝试下一个参数
             }
           });
         }
         
         // 方式3: 直接访问参数对象
-        if (!paramFound && internalModel.parameters) {
+        if (!paramFound && parameters) {
           try {
-            // 遍历所有参数，查找包含mouth�?
-            for (let i = 0; i < internalModel.parameters.count; i++) {
-              const param = internalModel.parameters.get(i);
+            // 遍历所有参数，查找包含 mouth 的参数
+            for (let i = 0; i < parameters.count; i++) {
+              const param = parameters.get(i);
               if (param && param.id && param.id.toLowerCase().includes('mouth')) {
                 const mouthValue = Math.min(1.0, Math.max(0.0, audioLevel / 100));
                 param.value = mouthValue;
@@ -211,9 +229,6 @@ export default function AudioManager({
           } catch (error) {
             console.warn('通过索引访问参数失败:', error);
           }
-        }
-        
-        if (!paramFound) {
         }
       });
     } catch (error) {
@@ -225,7 +240,7 @@ export default function AudioManager({
   const resetMouthAnimation = () => {
     try {
       forEachModel((model) => {
-        const internalModel = (model as any).internalModel;
+        const internalModel = (model as unknown as { internalModel?: Live2DInternalModelAccess }).internalModel;
         if (!internalModel) return;
         
         // 重置所有嘴部参�?
@@ -257,60 +272,6 @@ export default function AudioManager({
     else fn(cur as Live2DModel);
   };
 
-  // 添加音频片段
-  const addAudioClip = async () => {
-    try {
-      // 初始化音频上下文
-      initAudioContext();
-      
-      // 创建文件输入元素
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = 'audio/*';
-      input.multiple = false;
-      
-      input.onchange = async (e) => {
-        const file = (e.target as HTMLInputElement).files?.[0];
-        if (!file) return;
-        
-        // 创建音频URL
-        const audioUrl = URL.createObjectURL(file);
-        
-        // 获取音频时长
-        const audio = new Audio(audioUrl);
-        await new Promise((resolve) => {
-          audio.onloadedmetadata = resolve;
-          audio.load();
-        });
-        
-        const duration = audio.duration;
-        if (duration <= 0) {
-          alert('无法获取音频时长');
-          return;
-        }
-        
-        // 创建音频片段
-        const audioClip: Clip = {
-          id: crypto.randomUUID(),
-          name: file.name.replace(/\.[^/.]+$/, ''), // 移除文件扩展�?
-          start: 0, // 这里需要从外部传入
-          duration: duration,
-          audioUrl: audioUrl,
-        };
-        
-        // 创建音频元素并存储引�?
-        registerAudioElement(audioClip.id, audioUrl);
-        
-        // 这里需要调用外部的添加函数
-      };
-      
-      input.click();
-    } catch (error) {
-      console.error('导入音频失败:', error);
-      alert('导入音频失败: ' + error);
-    }
-  };
-
   // 清理音频引用
   const cleanupAudio = () => {
     audioRefs.current.forEach(audio => {
@@ -323,7 +284,7 @@ export default function AudioManager({
       try {
         source.disconnect();
         analyzer.disconnect();
-      } catch {}
+      } catch { /* 已断开时忽略 */ }
     });
     audioAnalyzersRef.current.clear();
     
@@ -344,7 +305,6 @@ export default function AudioManager({
   // 音频分析和嘴部动画处�?
   const processAudioAnimation = (t: number) => {
     let audioLevel = 0;
-    let activeAudioCount = 0;
     
     audioClips.forEach(clip => {
       const audioElement = audioRefs.current.get(clip.id);
@@ -355,8 +315,7 @@ export default function AudioManager({
       }
       
       if (t >= clip.start && t < clip.start + clip.duration) {
-        activeAudioCount++;
-        // 分析当前播放音频的电�?
+        // 分析当前播放音频的电平
         try {
           const { analyzer } = analyzerData;
           const bufferLength = analyzer.frequencyBinCount;
@@ -379,22 +338,14 @@ export default function AudioManager({
             const average = sum / count;
             const level = Math.min(100, Math.max(0, (average / 255) * 100));
             audioLevel = Math.max(audioLevel, level);
-            
-            // �?00ms输出一次音频电平信�?
-            if (Math.floor(t * 10) % 10 === 0) {
-            }
           }
         } catch (error) {
-          console.error('�?音频分析失败:', error);
+          console.error('音频分析失败:', error);
         }
       }
     });
     
-    // �?00ms输出一次总体音频信息
-    if (Math.floor(t * 10) % 10 === 0) {
-    }
-    
-    // 更新状态中的音频电�?
+    // 更新状态中的音频电平
     setCurrentAudioLevel(audioLevel);
     
     // 应用嘴部动画
@@ -414,30 +365,6 @@ export default function AudioManager({
     }
   };
 
-  // 音频播放控制
-  const playAudioAtTime = (t: number) => {
-    audioClips.forEach(clip => {
-      const audioElement = audioRefs.current.get(clip.id);
-      if (!audioElement) return;
-      
-      if (t >= clip.start && t < clip.start + clip.duration) {
-        // 如果音频还没开始播放，开始播�?
-        if (audioElement.paused) {
-          audioElement.currentTime = t - clip.start;
-          audioElement.play().catch(err => {
-            console.warn('音频播放失败:', err);
-          });
-        }
-      } else {
-        // 如果音频不在播放时间范围内，停止播放
-        if (!audioElement.paused) {
-          audioElement.pause();
-          audioElement.currentTime = 0;
-        }
-      }
-    });
-  };
-
   return {
     audioRefs,
     audioContextRef,
@@ -450,10 +377,8 @@ export default function AudioManager({
     unregisterAudioElement,
     applyMouthAnimation,
     resetMouthAnimation,
-    addAudioClip,
     cleanupAudio,
     stopAllAudio,
-    processAudioAnimation,
-    playAudioAtTime
+    processAudioAnimation
   };
 } 

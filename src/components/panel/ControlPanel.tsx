@@ -2,6 +2,8 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ExportToolbar from "../ExportToolbar";
 import type { SubtitleClip } from "../timeline/clipTypes";
+import type { ModelPackage } from "../../utils/modelLibrary";
+import type { VideoExportFormat, VideoExportMode } from "../../utils/videoExporter";
 
 interface Motion {
   name: string;
@@ -46,6 +48,14 @@ type Props = {
   selectedModel: string | null;
   onSelectModel: (relPath: string | null) => void;
   onRefreshModels?: () => void;
+  modelPackages: ModelPackage[];
+  isImportingModel: boolean;
+  onImportModel: () => void;
+  onImportModelFolder: () => void;
+  onDeleteModelPackage: (id: string) => void;
+  onSaveProject: () => void;
+  onOpenProject: () => void;
+  autosaveStatus: string;
 
   modelData: ModelData | null;
   motionLen: Record<string, number>;
@@ -103,18 +113,13 @@ type Props = {
   setRecordingQuality: (quality: "low" | "medium" | "high") => void;
   transparentBg: boolean;
   setTransparentBg: (transparent: boolean) => void;
-  recState: "idle" | "rec" | "done" | "offline";
-  recordingTime: number;
-  recordingProgress: number;
-  blob: Blob | null;
-  onStartRecording: () => void;
-  onStopRecording: () => void;
-  onSaveWebM: () => void;
-  onConvertToMov: () => void;
+  exportState: "idle" | "done" | "exporting";
+  exportTime: number;
+  exportProgress: number;
+  onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => void;
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
-  isVp9AlphaSupported: () => boolean;
 };
 
 const inspectorTabs: Array<{ id: InspectorTab; label: string }> = [
@@ -197,6 +202,16 @@ export default function ControlPanel(props: Props) {
     onChangeInspectorTab,
     onToggleWebGALMode,
     selectedModel,
+    modelList,
+    modelPackages,
+    isImportingModel,
+    onImportModel,
+    onImportModelFolder,
+    onDeleteModelPackage,
+    onSaveProject,
+    onOpenProject,
+    autosaveStatus,
+    onSelectModel,
     onRefreshModels,
     modelData,
     motionLen,
@@ -244,18 +259,13 @@ export default function ControlPanel(props: Props) {
     setRecordingQuality,
     transparentBg,
     setTransparentBg,
-    recState,
-    recordingTime,
-    recordingProgress,
-    blob,
-    onStartRecording,
-    onStopRecording,
-    onSaveWebM,
-    onConvertToMov,
+    exportState,
+    exportTime,
+    exportProgress,
+    onExportVideo,
     onExportSubtitlesSrt,
     onTakeScreenshot,
     onTakePartsScreenshots,
-    isVp9AlphaSupported,
   } = props;
 
   const [motionQuery, setMotionQuery] = useState("");
@@ -265,6 +275,9 @@ export default function ControlPanel(props: Props) {
   const [exprQuery, setExprQuery] = useState("");
   const [exprPage, setExprPage] = useState(1);
   const [exprPageSize, setExprPageSize] = useState(12);
+  const [exportFormat, setExportFormat] = useState<VideoExportFormat>("webm");
+  const [exportMode, setExportMode] = useState<VideoExportMode>("all");
+  const [includeExportAudio, setIncludeExportAudio] = useState(true);
   const [availableSubtitleFonts, setAvailableSubtitleFonts] = useState<string[]>(FALLBACK_SUBTITLE_FONTS);
   const paneScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -523,6 +536,57 @@ export default function ControlPanel(props: Props) {
       <div ref={paneScrollRef} className="workspace-pane-scroll">
         {mode === "resources" ? (
           <>
+            <PanelSection title="模型库" meta={`${modelList.length} 个模型`}>
+              <div className="model-library-actions">
+                <button className="btn btn--accent" onClick={onImportModel} disabled={isImportingModel}>
+                  {isImportingModel ? "正在导入…" : "导入模型文件 / ZIP"}
+                </button>
+                <button className="btn btn--quiet" onClick={onImportModelFolder} disabled={isImportingModel}>
+                  选择模型文件夹
+                </button>
+              </div>
+              {modelList.length === 0 ? (
+                <div className="pane-empty model-library-empty">
+                  <strong>模型库还是空的</strong>
+                  <span>选择模型文件夹，或导入 .zip / 模型配置文件。资源会复制到应用管理的模型库。</span>
+                </div>
+              ) : (
+                <div className="model-library-list">
+                  {modelPackages.map((pack) => (
+                    <div className="model-library-package" key={pack.id}>
+                      <div className="model-library-package-head">
+                        <strong>{pack.name}</strong>
+                        <button className="btn btn--quiet model-library-remove" onClick={() => onDeleteModelPackage(pack.id)} title="从模型库移除">
+                          移除
+                        </button>
+                      </div>
+                      {pack.modelPaths.map((path) => (
+                        <button
+                          key={path}
+                          className={`model-library-entry ${selectedModel === path ? "is-active" : ""}`}
+                          onClick={() => onSelectModel(path)}
+                          title={path}
+                        >
+                          <span>{path.split("/").slice(-1)[0]}</span>
+                          <small>{selectedModel === path ? "当前预览" : "选择模型"}</small>
+                        </button>
+                      ))}
+                    </div>
+                  ))}
+                  {modelList.filter((path) => !modelPackages.some((pack) => pack.modelPaths.includes(path))).map((path) => (
+                    <button
+                      key={path}
+                      className={`model-library-entry model-library-entry--legacy ${selectedModel === path ? "is-active" : ""}`}
+                      onClick={() => onSelectModel(path)}
+                      title={path}
+                    >
+                      <span>{path.split("/").slice(-1)[0]}</span>
+                      <small>{selectedModel === path ? "当前预览" : "旧资源"}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </PanelSection>
             <PanelSection title="动作" meta={`${filteredMotions.length} 条`} className="workspace-section--library">
               <div className="toolbar-row">
                 <input
@@ -638,11 +702,6 @@ export default function ControlPanel(props: Props) {
                 </PanelSection>
 
                 <PanelSection title="变换">
-                  <div className="pane-note">
-                    {characterTransformMode === "single-relative"
-                      ? "单模型坐标以预览区中心为 0，X / Y 使用百分比。"
-                      : "复合模型这里控制的是整组容器坐标，不是单个子角色的局部位置。"}
-                  </div>
                   <div className="transform-grid">
                     {transformFields.map(([key, label]) => (
                       <label key={key} className="field-stack">
@@ -752,7 +811,6 @@ export default function ControlPanel(props: Props) {
                   {subtitleClips.length === 0 ? (
                     <div className="pane-empty">
                       <strong>还没有字幕片段</strong>
-                      <span>可以手动新增，或在 WebGAL 导入时勾选字幕一起进入时间线。</span>
                     </div>
                   ) : (
                     <div className="subtitle-list">
@@ -840,24 +898,25 @@ export default function ControlPanel(props: Props) {
 
             {activeInspectorTab === "export" ? (
               <>
-                <PanelSection title="录制与导出">
+                <PanelSection title="导出视频">
                   <ExportToolbar
                     recordingQuality={recordingQuality}
                     setRecordingQuality={setRecordingQuality}
                     transparentBg={transparentBg}
                     setTransparentBg={setTransparentBg}
-                    recState={recState}
-                    recordingTime={recordingTime}
-                    recordingProgress={recordingProgress}
-                    blob={blob}
-                    onStartRecording={onStartRecording}
-                    onStopRecording={onStopRecording}
-                    onSaveWebM={onSaveWebM}
-                    onConvertToMov={onConvertToMov}
+                    includeAudio={includeExportAudio}
+                    setIncludeAudio={setIncludeExportAudio}
+                    exportFormat={exportFormat}
+                    setExportFormat={setExportFormat}
+                    exportMode={exportMode}
+                    setExportMode={setExportMode}
+                    exportState={exportState}
+                    exportTime={exportTime}
+                    exportProgress={exportProgress}
+                    onExportVideo={onExportVideo}
                     onExportSubtitlesSrt={onExportSubtitlesSrt}
                     onTakeScreenshot={onTakeScreenshot}
                     onTakePartsScreenshots={onTakePartsScreenshots}
-                    isVp9AlphaSupported={isVp9AlphaSupported}
                   />
                 </PanelSection>
                 <PanelSection title="会话状态">
@@ -875,8 +934,8 @@ export default function ControlPanel(props: Props) {
                       <strong>{typeof currentFps === "number" ? currentFps.toFixed(1) : "--"}</strong>
                     </div>
                     <div className="stat-card">
-                      <span>录制状态</span>
-                      <strong>{recState === "rec" ? "录制中" : recState === "offline" ? "离线导出中" : recState === "done" ? "可下载" : "待机"}</strong>
+                      <span>导出状态</span>
+                      <strong>{exportState === "exporting" ? "导出中" : exportState === "done" ? "已完成" : "待机"}</strong>
                     </div>
                   </div>
                 </PanelSection>
@@ -937,7 +996,17 @@ export default function ControlPanel(props: Props) {
                   </div>
                 </PanelSection>
                 <PanelSection title="工程操作">
+                  <div className="autosave-note">
+                    <span>恢复点</span>
+                    <strong>{autosaveStatus}</strong>
+                  </div>
                   <div className="button-row">
+                    <button className="btn btn--accent" onClick={onSaveProject}>
+                      保存工程副本
+                    </button>
+                    <button className="btn btn--quiet" onClick={onOpenProject}>
+                      打开工程
+                    </button>
                     {onRefreshModels ? (
                       <button className="btn btn--quiet" onClick={onRefreshModels}>
                         刷新模型索引

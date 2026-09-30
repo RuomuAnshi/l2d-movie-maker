@@ -6,6 +6,52 @@ use std::collections::HashSet;
 use glob::glob;
 use serde::Serialize;
 use serde_json::Value;
+use tauri::Window;
+use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_fs::FsExt;
+
+/// 由原生对话框选择模型资源，并仅授权本次选中的文件或目录供前端导入。
+#[tauri::command]
+pub async fn pick_model_source(window: Window, directory: bool) -> Result<Option<String>, String> {
+    let dialog = window.dialog().file().set_parent(&window);
+    let selected = if directory {
+        dialog.set_title("选择 Live2D 模型文件夹").blocking_pick_folder()
+    } else {
+        dialog
+            .set_title("导入 Live2D 模型")
+            .add_filter("Live2D 模型", &["zip", "json", "jsonl"])
+            .blocking_pick_file()
+    };
+    let Some(selected) = selected else { return Ok(None) };
+    let selected_path = selected.into_path().map_err(|e| format!("读取所选路径失败: {e}"))?;
+    let path = fs::canonicalize(&selected_path)
+        .map_err(|e| format!("读取所选资源失败 '{}': {e}", selected_path.display()))?;
+
+    let scope = window.fs_scope();
+    if directory {
+        if !path.is_dir() {
+            return Err(format!("所选路径不是文件夹: {}", path.display()));
+        }
+        scope.allow_directory(&path, true).map_err(|e| e.to_string())?;
+    } else {
+        if !path.is_file() {
+            return Err(format!("所选路径不是文件: {}", path.display()));
+        }
+        match path.extension().and_then(|ext| ext.to_str()).map(str::to_ascii_lowercase).as_deref() {
+            Some("zip") => scope.allow_file(&path).map_err(|e| e.to_string())?,
+            Some("json" | "jsonl") => {
+                let parent = path.parent().ok_or("无法确定模型资源目录")?;
+                scope.allow_directory(parent, true).map_err(|e| e.to_string())?;
+            }
+            _ => return Err("请选择模型文件夹、ZIP 或 JSON/JSONL 模型配置文件".into()),
+        }
+    }
+
+    if !scope.is_allowed(&path) {
+        return Err(format!("所选路径仍未获得读取权限: {}", path.display()));
+    }
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
 
 #[derive(Serialize)]
 pub struct ModelEntry {

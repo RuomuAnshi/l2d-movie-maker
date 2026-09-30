@@ -10,6 +10,7 @@ use std::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use tauri::{AppHandle, Manager};
 use tiny_http::{Header, Method, Request, Response, Server};
 use mime_guess;
 use urlencoding;
@@ -84,14 +85,61 @@ fn hash_root_key(path: &Path) -> String {
     format!("{:x}", hasher.finish())
 }
 
-fn ensure_model_server_started() -> Result<u16, String> {
-    let base_dir = exe_dir();
-    let model_dir = base_dir.join("model");
-
+fn prepare_model_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data_dir = app.path().app_data_dir()
+        .map_err(|e| format!("获取应用数据目录失败: {}", e))?;
+    let model_dir = app_data_dir.join("models");
     if !model_dir.exists() {
-        std::fs::create_dir_all(&model_dir)
-            .map_err(|e| format!("创建 model 目录失败: {}", e))?;
+        fs::create_dir_all(&model_dir)
+            .map_err(|e| format!("创建模型库目录失败: {}", e))?;
     }
+
+    // 一次性从旧版 exe_dir/model 迁移已有模型。之后的新模型只进入应用数据目录，
+    // 不依赖安装目录是否可写，也不影响旧目录中的源文件。
+    let has_content = fs::read_dir(&model_dir)
+        .map_err(|e| format!("读取模型库目录失败: {}", e))?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name != "models.json" && name != ".DS_Store" && !name.starts_with("._")
+        });
+    if !has_content {
+        let legacy_dir = exe_dir().join("model");
+        if legacy_dir.exists() && legacy_dir != model_dir {
+            copy_legacy_model_contents(&legacy_dir, &model_dir)?;
+        }
+    }
+    Ok(model_dir)
+}
+
+fn copy_legacy_model_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(source).map_err(|e| format!("读取旧模型目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("遍历旧模型目录失败: {}", e))?;
+        let name = entry.file_name();
+        let name_text = name.to_string_lossy();
+        if name_text == "models.json" || name_text == ".DS_Store" || name_text.starts_with("._") {
+            continue;
+        }
+        let from = entry.path();
+        let to = destination.join(&name);
+        let metadata = fs::symlink_metadata(&from)
+            .map_err(|e| format!("读取旧模型资源信息失败: {}", e))?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            fs::create_dir_all(&to).map_err(|e| format!("创建模型目录失败: {}", e))?;
+            copy_legacy_model_contents(&from, &to)?;
+        } else if metadata.is_file() {
+            fs::copy(&from, &to).map_err(|e| format!("迁移模型文件失败: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_model_server_started(model_dir: PathBuf) -> Result<u16, String> {
+    fs::create_dir_all(&model_dir).map_err(|e| format!("创建模型库目录失败: {}", e))?;
 
     static PORT: OnceLock<u16> = OnceLock::new();
     let port = *PORT.get_or_init(|| start_static_server(model_dir));
@@ -233,17 +281,31 @@ fn handle_req_with_roots(req: Request, model_root: &PathBuf, figure_root: &PathB
         }
     };
     
-    let path = root_dir.join(&*decoded_rel);
-
-    // 禁止目录遍历
-    if let Ok(canon) = path.canonicalize() {
-        if !canon.starts_with(root_dir.canonicalize().unwrap()) {
+    let requested_path = root_dir.join(&*decoded_rel);
+    let root_canonical = match root_dir.canonicalize() {
+        Ok(path) => path,
+        Err(_) => {
+            let mut resp = Response::from_string("Not Found").with_status_code(404);
+            add_cors_headers(&mut resp);
+            let _ = req.respond(resp);
+            return;
+        }
+    };
+    let path = match requested_path.canonicalize() {
+        Ok(path) if path.starts_with(&root_canonical) => path,
+        Ok(_) => {
             let mut resp = Response::from_string("Forbidden").with_status_code(403);
             add_cors_headers(&mut resp);
             let _ = req.respond(resp);
             return;
         }
-    }
+        Err(_) => {
+            let mut resp = Response::from_string("Not Found").with_status_code(404);
+            add_cors_headers(&mut resp);
+            let _ = req.respond(resp);
+            return;
+        }
+    };
 
     // 读取文件
     match std::fs::read(&path) {
@@ -453,9 +515,12 @@ fn generate_models_json(models_dir: &PathBuf) -> Result<(), String> {
 
 /// 获取模型服务器信息
 #[tauri::command]
-pub fn get_model_server_info() -> Result<ModelServerInfo, String> {
-    let model_dir = exe_dir().join("model");
-    let port = ensure_model_server_started()?;
+pub fn get_model_server_info(app: AppHandle) -> Result<ModelServerInfo, String> {
+    let model_dir = prepare_model_dir(&app)?;
+    let port = ensure_model_server_started(model_dir.clone())?;
+
+    // 启动时重新扫描，避免索引与用户管理的资源库状态不一致。
+    generate_models_json(&model_dir)?;
 
     Ok(ModelServerInfo {
         base_url: format!("http://127.0.0.1:{}/model", port),
@@ -464,7 +529,7 @@ pub fn get_model_server_info() -> Result<ModelServerInfo, String> {
 }
 
 #[tauri::command]
-pub fn register_external_asset_root(path: String) -> Result<ExternalAssetRootInfo, String> {
+pub fn register_external_asset_root(app: AppHandle, path: String) -> Result<ExternalAssetRootInfo, String> {
     let root = PathBuf::from(&path);
     if !root.exists() {
         return Err(format!("外部资源目录不存在: {}", path));
@@ -500,7 +565,8 @@ pub fn register_external_asset_root(path: String) -> Result<ExternalAssetRootInf
         }
     };
 
-    let port = ensure_model_server_started()?;
+    let model_dir = prepare_model_dir(&app)?;
+    let port = ensure_model_server_started(model_dir)?;
 
     Ok(ExternalAssetRootInfo {
         root_key: root_key.clone(),
@@ -511,9 +577,9 @@ pub fn register_external_asset_root(path: String) -> Result<ExternalAssetRootInf
 
 /// 刷新模型索引
 #[tauri::command]
-pub fn refresh_model_index() -> Result<Vec<String>, String> {
-    let base_dir = exe_dir();
-    let model_dir = base_dir.join("model");
+pub fn refresh_model_index(app: AppHandle) -> Result<Vec<String>, String> {
+    let model_dir = prepare_model_dir(&app)?;
+    let _port = ensure_model_server_started(model_dir.clone())?;
     
     // 生成新的 models.json
     generate_models_json(&model_dir)?;
