@@ -52,6 +52,7 @@ export function isAnimationDocument(
       typeof g.id === "string" &&
       typeof g.name === "string" &&
       ["motion", "expression"].includes(g.kind) &&
+      (g.sourceAssetId == null || (typeof g.sourceAssetId === "string" && !!g.sourceAssetId)) &&
       [g.start, g.duration, g.sourceDuration, g.offset, g.speed].every(
         Number.isFinite,
       ) &&

@@ -31,6 +31,7 @@ export type SourceGroup = {
   id: string;
   name: string;
   kind: "motion" | "expression";
+  sourceAssetId?: string;
   start: number;
   duration: number;
   sourceDuration: number;

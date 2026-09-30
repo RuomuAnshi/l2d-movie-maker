@@ -6,6 +6,11 @@ export type Clip = {
   audioUrl?: string;
   audioPath?: string;
   audioSourceDuration?: number;
+  sourceIn?: number;
+  playbackRate?: number;
+  gain?: number;
+  fadeIn?: number;
+  fadeOut?: number;
   waveformPeaks?: number[];
   audioBuffer?: AudioBuffer;
   lipSync?: number[];

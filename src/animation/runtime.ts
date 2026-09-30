@@ -41,7 +41,7 @@ export class ModelAdapter {
   private animatedTargets = new Set<string>();
   model: RuntimeModel;
   index: number;
-  constructor(model: RuntimeModel, index: number) {
+  constructor(model: RuntimeModel, index: number, identity?: { characterId: string; partId: string }) {
     this.model = model;
     this.index = index;
     model.autoUpdate = false;
@@ -50,8 +50,8 @@ export class ModelAdapter {
     const internal = model.internalModel,
       core = internal.coreModel;
     const native = core._model ?? core;
-    const character = String(model.__characterId ?? "main"),
-      part = String(model.__jsonlRoleMeta?.index ?? index);
+    const character = identity?.characterId ?? String(model.__characterId ?? "main"),
+      part = identity?.partId ?? String(model.__jsonlRoleMeta?.index ?? index);
     const add = (
       id: string,
       min: number,
@@ -156,7 +156,7 @@ export class ModelAdapter {
       }
     }
   }
-  async material(name: string, kind: "motion" | "expression") {
+  materialReference(name: string, kind: "motion" | "expression"): { partId: string; uri: string } {
     const data = readModelDataFromRuntime(this.model);
     const file =
       kind === "motion"
@@ -168,10 +168,14 @@ export class ModelAdapter {
       );
     const settings = this.model.internalModel.settings;
     const base = this.model.__compositeResolvedUrl ?? settings.url;
-    const url = settings.resolveURL?.(file) ?? new URL(file, base).href;
-    const response = await fetch(url);
+    const uri = settings.resolveURL?.(file) ?? new URL(file, base).href;
+    return { partId: this.tracks[0].definition.partId, uri };
+  }
+  async material(name: string, kind: "motion" | "expression") {
+    const { uri } = this.materialReference(name, kind);
+    const response = await fetch(uri);
     if (!response.ok)
-      throw new Error(`素材读取失败：${url} (${response.status})`);
+      throw new Error(`素材读取失败：${uri} (${response.status})`);
     return response.text();
   }
   write(values: Record<string, number>) {

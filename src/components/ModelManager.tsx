@@ -1,4 +1,5 @@
 import * as PIXI from "pixi.js";
+import { useEffect, useRef } from "react";
 import {
   loadPixiCompositeModel,
   resolveCompositePath,
@@ -6,6 +7,7 @@ import {
   type ExtractCompositeSelectorsResult,
 } from "composite-model";
 import { Live2DModel } from "pixi-live2d-display";
+import { beginModelResourceLoad, retainModelResources, releaseModelResources } from "../sequence/modelResources";
 import {
   normalizeModelData,
   readModelDataFromRuntime,
@@ -44,6 +46,7 @@ type InternalModelLike = {
   angleYParamIndex?: number;
   angleZParamIndex?: number;
   eyeBlink?: InternalEyeBlinkLike;
+  motionManager?: { stopAllMotions?: () => void; expressionManager?: { stopAllExpressions?: () => void } };
   coreModel?: {
     setParamFloat?: (id: string, value: number) => void;
   };
@@ -96,7 +99,22 @@ export default function ModelManager({
   onTransformChange,
   onBeforeModelDispose
 }: ModelManagerProps) {
-  
+  const loadGeneration = useRef(0);
+  const mounted = useRef(true);
+  const fetchController = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      loadGeneration.current += 1;
+      fetchController.current?.abort();
+      disposeCurrentModel(false);
+    };
+    // Factory refs persist across renders; cleanup deliberately avoids state callbacks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 工具函数
   const isJsonl = (u: string) => /\.jsonl(\?|#|$)/i.test(u);
   
@@ -115,36 +133,42 @@ export default function ModelManager({
     else fn(cur as Live2DModel);
   };
 
-  const cleanupCurrentModel = () => {
-    onBeforeModelDispose?.();
-    setModelData(null);
-    const app = appRef.current;
-    if (!app) return;
+  const disposeModel = (model: JsonlLive2DModel) => {
     try {
-      
-      if (Array.isArray(modelRef.current)) {
-        // 移除并销毁复合容�?
-        if (groupContainerRef.current) {
-          (groupContainerRef.current as DraggableCleanupTarget).__dragCleanup?.();
-          groupContainerRef.current.removeChildren().forEach((child) => {
-            try { child.destroy?.({ children: true, texture: true, baseTexture: true }); } catch { /* 已销毁的子节点忽略 */ }
-          });
-          app.stage.removeChild(groupContainerRef.current);
-          try { groupContainerRef.current.destroy?.({ children: true }); } catch { /* 已销毁的容器忽略 */ }
-        }
-      } else if (modelRef.current) {
-        app.stage.removeChild(modelRef.current);
-        try { modelRef.current.destroy?.({ children: true, texture: true, baseTexture: true }); } catch { /* 已销毁的模型忽略 */ }
-      }
-      
-      // 清理引用
-      groupContainerRef.current = null;
-      modelRef.current = null;
-      isCompositeRef.current = false;
-      motionBaseRef.current = null;
-      
-    } catch (error) {
-      console.warn('⚠️ 模型清理过程中出现警�?', error);
+      (model as DraggableCleanupTarget).__dragCleanup?.();
+      model.parent?.removeChild(model);
+      model.destroy({ children: true, texture: false, baseTexture: false });
+    } catch (error) { console.warn("模型清理失败", error); }
+    finally { releaseModelResources(model); }
+  };
+
+  const disposeContainer = (container: PIXI.Container) => {
+    (container as DraggableCleanupTarget).__dragCleanup?.();
+    container.parent?.removeChild(container);
+    try { container.destroy({ children: false }); } catch { /* 已销毁的容器忽略 */ }
+  };
+
+  const disposeCurrentModel = (notify = true) => {
+    if (notify) { onBeforeModelDispose?.(); setModelData(null); }
+    const current = modelRef.current, container = groupContainerRef.current;
+    modelRef.current = null;
+    groupContainerRef.current = null;
+    isCompositeRef.current = false;
+    motionBaseRef.current = null;
+    if (Array.isArray(current)) current.forEach((model) => disposeModel(model as JsonlLive2DModel));
+    else if (current) disposeModel(current as JsonlLive2DModel);
+    if (container) disposeContainer(container);
+  };
+
+  const cleanupCurrentModel = () => {
+    loadGeneration.current += 1;
+    fetchController.current?.abort();
+    disposeCurrentModel();
+  };
+
+  const assertCurrentLoad = (app: PIXI.Application, generation: number) => {
+    if (!mounted.current || loadGeneration.current !== generation || appRef.current !== app) {
+      throw new DOMException("模型加载已取消", "AbortError");
     }
   };
 
@@ -169,9 +193,13 @@ export default function ModelManager({
   };
 
   const disableModelAutoBehaviors = (model: JsonlLive2DModel) => {
+    model.autoUpdate = false;
+    model.deltaTime = 0;
     model.autoInteract = false;
     const im = model.internalModel as unknown as InternalModelLike | undefined;
     if (!im) return;
+    im.motionManager?.stopAllMotions?.();
+    im.motionManager?.expressionManager?.stopAllExpressions?.();
 
     (["angleXParamIndex", "angleYParamIndex", "angleZParamIndex"] as const).forEach((k) => {
       if (typeof im[k] === "number") im[k] = -1;
@@ -192,8 +220,11 @@ export default function ModelManager({
   const synthesizeCompositeModelData = async (
     selectors: ExtractCompositeSelectorsResult,
     firstModelUrl: string,
+    signal?: AbortSignal,
   ): Promise<ModelData> => {
-    const firstModelJson = normalizeModelData(await (await fetch(firstModelUrl, { cache: "no-cache" })).json());
+    const response = await fetch(firstModelUrl, { cache: "no-cache", signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    const firstModelJson = normalizeModelData(await response.json());
     const fullMotions = firstModelJson.motions;
     const motionsFiltered: ModelData["motions"] = {};
 
@@ -346,165 +377,137 @@ export default function ModelManager({
     };
   };
 
-  // 单模型加�?
-  const loadSingleModel = async (app: PIXI.Application, url: string) => {
+  const loadSingleModel = async (app: PIXI.Application, url: string, generation: number, signal: AbortSignal) => {
+    let model: JsonlLive2DModel | null = null;
     try {
-      const model = await Live2DModel.from(url) as JsonlLive2DModel;
+      model = await Live2DModel.from(url, { autoUpdate: false, autoInteract: false }) as JsonlLive2DModel;
+      retainModelResources(model);
+      disableModelAutoBehaviors(model);
+      assertCurrentLoad(app, generation);
       model.__characterId = "main";
       model.__characterLabel = "Main Model";
-      modelRef.current = model;
-      isCompositeRef.current = false;
-      motionBaseRef.current = url.slice(0, url.lastIndexOf("/") + 1);
-
-      // 读取 json
-      const res = await fetch(url, { cache: "no-cache" });
-      
-      // 检查响应状�?
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      
-      const normalized = normalizeModelData(await res.json());
-      setModelData(withFallbackModelData(normalized, readModelDataFromRuntime(model)));
+      model.__compositeResolvedUrl = url;
+      const response = await fetch(url, { cache: "no-cache", signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const normalized = normalizeModelData(await response.json());
+      assertCurrentLoad(app, generation);
 
       model.anchor.set(0.5, 0.5);
       model.scale.set(0.3);
       model.position.set(app.screen.width / 2, app.screen.height / 2);
-
-      disableModelAutoBehaviors(model);
-
-      app.stage.addChild(model);
       if (enableDragging) makeDraggableModel(model);
-      
-      // 计算模型边框用于录制优化
-      const modelWidth = model.width * model.scale.x;
-      const modelHeight = model.height * model.scale.y;
-      const modelX = model.position.x - modelWidth / 2;
-      const modelY = model.position.y - modelHeight / 2;
-      
-      setCustomRecordingBounds({
-        x: Math.max(0, modelX),
-        y: Math.max(0, modelY),
-        width: Math.min(modelWidth, app.screen.width),
-        height: Math.min(modelHeight, app.screen.height)
-      });
-      
-      
-    } catch (err) {
-      console.error("�?模型加载失败:", err);
+      const data = withFallbackModelData(normalized, readModelDataFromRuntime(model));
+      disposeCurrentModel();
+      app.stage.addChild(model);
+      modelRef.current = model;
+      isCompositeRef.current = false;
+      motionBaseRef.current = url.slice(0, url.lastIndexOf("/") + 1);
+      setModelData(data);
+      updateBoundsFromDisplayObject(model);
+    } catch (error) {
+      if (model) {
+        if (modelRef.current === model) {
+          modelRef.current = null; isCompositeRef.current = false; motionBaseRef.current = null;
+        }
+        disposeModel(model);
+      }
+      if (!mounted.current || generation !== loadGeneration.current || appRef.current !== app) return;
+      console.error("模型加载失败", error);
       setModelData(null);
-      throw err;
+      throw error;
     }
   };
 
-  const loadJsonlComposite = async (app: PIXI.Application, jsonlUrl: string) => {
+  const loadJsonlComposite = async (app: PIXI.Application, jsonlUrl: string, generation: number, signal: AbortSignal) => {
+    let container: PIXI.Container | null = null;
+    const partialModels: JsonlLive2DModel[] = [];
     try {
-      const response = await fetch(jsonlUrl, { cache: "no-cache" });
-      
-      // 检查响应状态和内容类型
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-      
+      const response = await fetch(jsonlUrl, { cache: "no-cache", signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       const text = await response.text();
-      
-      // 检查是否是HTML内容（文件不存在时的回退页面�?
-      if (text.includes('<!DOCTYPE html>') || text.includes('<html')) {
-        throw new Error(`文件不存在或路径错误: ${jsonlUrl} (返回HTML页面)`);
-      }
-      
+      assertCurrentLoad(app, generation);
+      if (text.includes('<!DOCTYPE html>') || text.includes('<html')) throw new Error(`文件不存在或路径错误: ${jsonlUrl} (返回HTML页面)`);
       const loaded = await loadPixiCompositeModel({
-        jsonlText: text,
-        jsonlUrl,
-        source: jsonlUrl,
+        jsonlText: text, jsonlUrl, source: jsonlUrl,
         createContainer: () => {
-          const container = new PIXI.Container();
+          container = new PIXI.Container();
           container.sortableChildren = true;
           container.position.set(app.screen.width / 2, app.screen.height / 2);
           return container;
         },
-        resolveAssetUrl: async (part, manifest) => resolveCompositePath(part.path, manifest.source),
+        resolveAssetUrl: async (part, manifest) => {
+          assertCurrentLoad(app, generation);
+          return resolveCompositePath(part.path, manifest.source);
+        },
         configureModel: async ({ model, part, resolvedUrl, modelIndex }) => {
           const taggedModel = model as unknown as JsonlLive2DModel;
+          // Retain each completed part before the loader waits for another one.
+          partialModels.push(taggedModel);
+          retainModelResources(taggedModel);
+          disableModelAutoBehaviors(taggedModel);
+          assertCurrentLoad(app, generation);
           const { rawRoleId, mergedRoleId } = getCharacterIdFromPart(part, modelIndex);
           taggedModel.__characterId = mergedRoleId;
           taggedModel.__characterLabel = mergedRoleId;
           taggedModel.__compositeResolvedUrl = resolvedUrl;
-          taggedModel.__jsonlRoleMeta = {
-            id: rawRoleId,
-            folder: part.folder,
-            path: resolvedUrl,
-            index: part.index ?? modelIndex,
-          };
-
+          taggedModel.__jsonlRoleMeta = { id: rawRoleId, folder: part.folder, path: resolvedUrl, index: part.index ?? modelIndex };
           taggedModel.anchor?.set?.(0.5);
-
-          const baseScaleX = app.screen.width / taggedModel.width;
-          const baseScaleY = app.screen.height / taggedModel.height;
-          const base = Math.min(baseScaleX, baseScaleY);
+          const base = Math.min(app.screen.width / taggedModel.width, app.screen.height / taggedModel.height);
           taggedModel.scale.set(base * (part.xscale ?? 1), base * (part.yscale ?? 1));
           taggedModel.position.set(part.x ?? 0, part.y ?? 0);
-
-          disableModelAutoBehaviors(taggedModel);
         },
       });
-
-      groupContainerRef.current = loaded.container;
-      app.stage.addChild(loaded.container);
-
-      if (enableDragging) {
-        makeDraggableContainer(loaded.container as DraggableDisplayObject);
-      }
-
-      requestAnimationFrame(() => {
-        updateBoundsFromDisplayObject(loaded.container);
-      });
-
-      const children = loaded.models as unknown as Live2DModel[];
-      const firstModel = children[0] as JsonlLive2DModel | undefined;
-      const firstModelUrl = firstModel?.__compositeResolvedUrl;
-
-      if (!firstModelUrl) {
-        throw new Error(`无法解析首个子模型路径: ${jsonlUrl}`);
-      }
-
-      motionBaseRef.current = firstModelUrl.slice(0, firstModelUrl.lastIndexOf("/") + 1);
-
+      assertCurrentLoad(app, generation);
+      const children = loaded.models as unknown as JsonlLive2DModel[];
+      const firstModel = children[0], firstModelUrl = firstModel?.__compositeResolvedUrl;
+      if (!firstModelUrl) throw new Error(`无法解析首个子模型路径: ${jsonlUrl}`);
+      let data: ModelData;
       try {
-        const synthesized = await synthesizeCompositeModelData(loaded.selectors, firstModelUrl);
-        setModelData(withFallbackModelData(synthesized, readModelDataFromRuntime(firstModel)));
+        const synthesized = await synthesizeCompositeModelData(loaded.selectors, firstModelUrl, signal);
+        data = withFallbackModelData(synthesized, readModelDataFromRuntime(firstModel));
       } catch (error) {
-        console.warn("Failed to synthesize composite modelData", error);
-        setModelData(readModelDataFromRuntime(firstModel) ?? { motions: {}, expressions: [] });
+        assertCurrentLoad(app, generation);
+        console.warn("复合模型素材索引读取失败，使用运行时索引", error);
+        data = readModelDataFromRuntime(firstModel) ?? { motions: {}, expressions: [] };
       }
-
+      assertCurrentLoad(app, generation);
+      if (enableDragging) makeDraggableContainer(loaded.container as DraggableDisplayObject);
+      disposeCurrentModel();
+      app.stage.addChild(loaded.container);
+      groupContainerRef.current = loaded.container;
       modelRef.current = children;
       isCompositeRef.current = true;
-      
-    } catch (err) {
-      console.error("loadJsonlComposite error:", err);
-      setModelData(null);
-      // 清理容器
-      if (groupContainerRef.current && appRef.current) {
-        try {
-          appRef.current.stage.removeChild(groupContainerRef.current);
-          groupContainerRef.current.destroy({ children: true });
-        } catch { /* 清理失败不阻断错误处理 */ }
+      motionBaseRef.current = firstModelUrl.slice(0, firstModelUrl.lastIndexOf("/") + 1);
+      setModelData(data);
+      requestAnimationFrame(() => {
+        if (mounted.current && generation === loadGeneration.current && appRef.current === app && groupContainerRef.current === loaded.container) updateBoundsFromDisplayObject(loaded.container);
+      });
+    } catch (error) {
+      if (groupContainerRef.current === container && container) {
+        groupContainerRef.current = null; modelRef.current = null; isCompositeRef.current = false; motionBaseRef.current = null;
       }
-      groupContainerRef.current = null;
-      modelRef.current = null;
-      isCompositeRef.current = false;
-      motionBaseRef.current = null;
-      throw err;
+      partialModels.forEach(disposeModel);
+      if (container) disposeContainer(container);
+      if (!mounted.current || generation !== loadGeneration.current || appRef.current !== app) return;
+      console.error("复合模型加载失败", error);
+      setModelData(null);
+      throw error;
     }
   };
 
-  // 实际加载：根据后缀分流
   const loadAnyModel = async (app: PIXI.Application, url: string) => {
-    if (isJsonl(url)) {
-      await loadJsonlComposite(app, url);
-    } else {
-      await loadSingleModel(app, url);
+    const generation = ++loadGeneration.current;
+    fetchController.current?.abort();
+    const controller = new AbortController();
+    fetchController.current = controller;
+    const finishLoad = beginModelResourceLoad();
+    try {
+      assertCurrentLoad(app, generation);
+      if (isJsonl(url)) await loadJsonlComposite(app, url, generation, controller.signal);
+      else await loadSingleModel(app, url, generation, controller.signal);
+    } finally {
+      finishLoad();
+      if (fetchController.current === controller) fetchController.current = null;
     }
   };
 

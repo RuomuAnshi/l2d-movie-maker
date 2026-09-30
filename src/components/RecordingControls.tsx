@@ -18,6 +18,8 @@ export interface RecordingControlsProps {
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
+  exportSequenceLabel?: string;
+  projectFps?: number;
 }
 
 export default function RecordingControls({
@@ -38,11 +40,14 @@ export default function RecordingControls({
   onExportSubtitlesSrt,
   onTakeScreenshot,
   onTakePartsScreenshots,
+  exportSequenceLabel,
+  projectFps,
 }: RecordingControlsProps) {
   const isBusy = exportState === "exporting";
 
   return (
     <div className="recording-controls">
+      {exportSequenceLabel && <div className="pane-note">{exportSequenceLabel}</div>}
       <div className="export-options-grid">
         <label className="field-stack">
           <span className="field-label">格式</span>
@@ -66,14 +71,14 @@ export default function RecordingControls({
             onChange={(event) => setExportMode(event.target.value as VideoExportMode)}
           >
             <option value="all">全部</option>
-            <option value="live2d-only">仅角色</option>
-            <option value="subtitle-only">仅字幕</option>
+            <option value="live2d-only">仅画面</option>
+            <option value="subtitle-only">仅文字</option>
           </select>
         </label>
 
         <label className="field-stack">
           <span className="field-label">帧率</span>
-          <select
+          {projectFps ? <input className="input" aria-label="序列帧率" value={`${projectFps} fps`} readOnly /> : <select
             className="input"
             value={recordingQuality}
             disabled={isBusy}
@@ -82,7 +87,7 @@ export default function RecordingControls({
             <option value="low">24 fps</option>
             <option value="medium">30 fps</option>
             <option value="high">60 fps</option>
-          </select>
+          </select>}
         </label>
       </div>
 
@@ -105,7 +110,7 @@ export default function RecordingControls({
             onChange={(event) => setIncludeAudio(event.target.checked)}
             className="transparent-bg-checkbox"
           />
-          音频轨
+          音频
         </label>
       </div>
 
@@ -142,9 +147,9 @@ export default function RecordingControls({
         <button onClick={onTakeScreenshot} disabled={isBusy} className="screenshot-button">
           截图
         </button>
-        <button onClick={onTakePartsScreenshots} disabled={isBusy} className="parts-screenshot-button">
+        {!projectFps && <button onClick={onTakePartsScreenshots} disabled={isBusy} className="parts-screenshot-button">
           部件截图
-        </button>
+        </button>}
       </div>
     </div>
   );

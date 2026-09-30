@@ -27,6 +27,28 @@ type Live2DInternalModelAccess = {
   };
 };
 
+export type BufferAudioItem = {
+  id: string;
+  assetId: string;
+  sourceTime: number;
+  rate: number;
+  gain: number;
+  active: boolean;
+  /** Remaining output time, used to cut nested clips at an exact audio sample. */
+  remainingDuration?: number;
+};
+
+type BufferPlayback = {
+  source: AudioBufferSourceNode;
+  gain: GainNode;
+  buffer: AudioBuffer;
+  assetId: string;
+  startedAt: number;
+  sourceTime: number;
+  rate: number;
+  endSourceTime: number;
+};
+
 export default function AudioManager({
   modelRef,
   audioClips,
@@ -36,16 +58,18 @@ export default function AudioManager({
   // 音频引用和分析器引用
   const audioRefs = React.useRef<Map<string, HTMLAudioElement>>(new Map());
   const audioContextRef = React.useRef<AudioContext | null>(null);
-  const audioAnalyzersRef = React.useRef<Map<string, { source: MediaElementAudioSourceNode; analyzer: AnalyserNode }>>(new Map());
+  const audioAnalyzersRef = React.useRef<Map<string, { source: MediaElementAudioSourceNode; analyzer: AnalyserNode; gain: GainNode }>>(new Map());
   const recordingDestinationRef = React.useRef<MediaStreamAudioDestinationNode | null>(null);
   const mouthAnimationRef = React.useRef<{ audioLevel: number; lastUpdate: number }>({ audioLevel: 0, lastUpdate: 0 });
+  const decodedAudioRef = React.useRef<Map<string, { url: string; buffer?: AudioBuffer; promise: Promise<AudioBuffer> }>>(new Map());
+  const bufferPlaybackRef = React.useRef<Map<string, BufferPlayback>>(new Map());
 
-  const connectAnalyzerOutputs = (analyzer: AnalyserNode) => {
+  const connectAnalyzerOutputs = (gain: GainNode) => {
     const context = audioContextRef.current;
     if (!context) return;
-    analyzer.connect(context.destination);
+    gain.connect(context.destination);
     if (recordingDestinationRef.current) {
-      analyzer.connect(recordingDestinationRef.current);
+      gain.connect(recordingDestinationRef.current);
     }
   };
 
@@ -72,11 +96,12 @@ export default function AudioManager({
     }
 
     if (createdRecordingDestination) {
-      audioAnalyzersRef.current.forEach(({ analyzer }) => {
+      audioAnalyzersRef.current.forEach(({ gain }) => {
         try {
-          analyzer.connect(recordingDestinationRef.current!);
+          gain.connect(recordingDestinationRef.current!);
         } catch { /* 已连接时忽略 */ }
       });
+      bufferPlaybackRef.current.forEach(({ gain }) => gain.connect(recordingDestinationRef.current!));
     }
   };
 
@@ -102,6 +127,7 @@ export default function AudioManager({
       try {
         existingAnalyzer.source.disconnect();
         existingAnalyzer.analyzer.disconnect();
+        existingAnalyzer.gain.disconnect();
       } catch { /* 已断开时忽略 */ }
       audioAnalyzersRef.current.delete(clipId);
     }
@@ -109,20 +135,23 @@ export default function AudioManager({
     const audioElement = new Audio(audioUrl);
     audioElement.crossOrigin = "anonymous";
     audioElement.preload = "auto";
-    audioElement.volume = 0.8;
+    audioElement.volume = 1;
     audioRefs.current.set(clipId, audioElement);
 
     if (audioContextRef.current) {
       try {
         const source = audioContextRef.current.createMediaElementSource(audioElement);
         const analyzer = audioContextRef.current.createAnalyser();
+        const gain = audioContextRef.current.createGain();
         analyzer.fftSize = 256;
         analyzer.smoothingTimeConstant = 0.8;
+        gain.gain.value = 0.8;
 
         source.connect(analyzer);
-        connectAnalyzerOutputs(analyzer);
+        analyzer.connect(gain);
+        connectAnalyzerOutputs(gain);
 
-        audioAnalyzersRef.current.set(clipId, { source, analyzer });
+        audioAnalyzersRef.current.set(clipId, { source, analyzer, gain });
       } catch (error) {
         console.warn("音频分析器初始化失败", error);
       }
@@ -144,9 +173,106 @@ export default function AudioManager({
       try {
         analyzerData.source.disconnect();
         analyzerData.analyzer.disconnect();
+        analyzerData.gain.disconnect();
       } catch { /* 已断开时忽略 */ }
       audioAnalyzersRef.current.delete(clipId);
     }
+  };
+
+  const setAudioGain = (clipId: string, value: number) => {
+    const gain = audioAnalyzersRef.current.get(clipId)?.gain;
+    if (!gain) return;
+    gain.gain.setValueAtTime(Number.isFinite(value) ? Math.max(0, value) : 0, gain.context.currentTime);
+  };
+
+  const prepareAudioBuffer = (assetId: string, url: string): Promise<AudioBuffer> => {
+    const cached = decodedAudioRef.current.get(assetId);
+    if (cached?.url === url) return cached.promise;
+    initAudioContext();
+    const context = audioContextRef.current;
+    if (!context) return Promise.reject(new Error("当前环境不支持音频解码。"));
+    const entry: { url: string; buffer?: AudioBuffer; promise: Promise<AudioBuffer> } = {
+      url,
+      promise: fetch(url).then(async response => {
+        if (!response.ok) throw new Error(`读取音频失败：HTTP ${response.status}`);
+        return context.decodeAudioData(await response.arrayBuffer());
+      }),
+    };
+    decodedAudioRef.current.set(assetId, entry);
+    entry.promise = entry.promise.then(buffer => {
+      if (decodedAudioRef.current.get(assetId) === entry) entry.buffer = buffer;
+      return buffer;
+    }).catch(error => {
+      if (decodedAudioRef.current.get(assetId) === entry) decodedAudioRef.current.delete(assetId);
+      throw error;
+    });
+    return entry.promise;
+  };
+
+  const getDecodedAudioBuffer = (assetId: string) => decodedAudioRef.current.get(assetId)?.buffer;
+
+  const stopBufferAudio = (id: string) => {
+    const playback = bufferPlaybackRef.current.get(id);
+    if (!playback) return;
+    bufferPlaybackRef.current.delete(id);
+    playback.source.onended = null;
+    try { playback.source.stop(); } catch { /* Already ended. */ }
+    playback.source.disconnect();
+    playback.gain.disconnect();
+  };
+
+  const syncBufferAudio = (items: BufferAudioItem[], isPlaying: boolean): void => {
+    // The V3 scheduler owns playback. HTML elements remain available for legacy
+    // metadata and never play alongside a decoded instance.
+    audioRefs.current.forEach(audio => { if (!audio.paused) audio.pause(); });
+    if (!isPlaying) {
+      for (const id of bufferPlaybackRef.current.keys()) stopBufferAudio(id);
+      return;
+    }
+    initAudioContext();
+    const context = audioContextRef.current;
+    if (!context) return;
+    const retained = new Set<string>();
+    for (const item of items) {
+      const buffer = decodedAudioRef.current.get(item.assetId)?.buffer;
+      if (!item.active || !buffer || !Number.isFinite(item.rate) || item.rate <= 0 || !Number.isFinite(item.sourceTime) || item.sourceTime < 0 || item.sourceTime >= buffer.duration || (item.remainingDuration != null && item.remainingDuration <= 0)) {
+        stopBufferAudio(item.id);
+        continue;
+      }
+      retained.add(item.id);
+      let playback = bufferPlaybackRef.current.get(item.id);
+      const predicted = playback ? playback.sourceTime + (context.currentTime - playback.startedAt) * playback.rate : NaN;
+      const endSourceTime = item.remainingDuration != null && Number.isFinite(item.remainingDuration)
+        ? Math.min(buffer.duration, item.sourceTime + item.remainingDuration * item.rate) : buffer.duration;
+      // Compare in output seconds so fast nested rates do not continually restart.
+      const driftLimit = Math.max(0.025, item.rate * 0.04);
+      if (playback && (playback.buffer !== buffer || playback.assetId !== item.assetId || playback.rate !== item.rate || Math.abs(predicted - item.sourceTime) > driftLimit || Math.abs(playback.endSourceTime - endSourceTime) > 1 / buffer.sampleRate)) {
+        stopBufferAudio(item.id);
+        playback = undefined;
+      }
+      if (!playback) {
+        const source = context.createBufferSource();
+        const gain = context.createGain();
+        source.buffer = buffer;
+        source.playbackRate.setValueAtTime(item.rate, context.currentTime);
+        gain.gain.setValueAtTime(Number.isFinite(item.gain) ? Math.max(0, item.gain) : 0, context.currentTime);
+        source.connect(gain);
+        connectAnalyzerOutputs(gain);
+        playback = { source, gain, buffer, assetId: item.assetId, startedAt: context.currentTime, sourceTime: item.sourceTime, rate: item.rate, endSourceTime };
+        bufferPlaybackRef.current.set(item.id, playback);
+        const instance = playback;
+        source.onended = () => {
+          if (bufferPlaybackRef.current.get(item.id) === instance) bufferPlaybackRef.current.delete(item.id);
+          source.disconnect(); gain.disconnect();
+        };
+        if (item.remainingDuration != null && Number.isFinite(item.remainingDuration)) {
+          source.start(context.currentTime, item.sourceTime, Math.min(buffer.duration - item.sourceTime, item.remainingDuration * item.rate));
+        } else source.start(context.currentTime, item.sourceTime);
+      } else {
+        playback.gain.gain.setValueAtTime(Number.isFinite(item.gain) ? Math.max(0, item.gain) : 0, context.currentTime);
+      }
+    }
+    for (const id of bufferPlaybackRef.current.keys()) if (!retained.has(id)) stopBufferAudio(id);
   };
 
   // 应用嘴部动画
@@ -274,16 +400,19 @@ export default function AudioManager({
 
   // 清理音频引用
   const cleanupAudio = () => {
+    for (const id of bufferPlaybackRef.current.keys()) stopBufferAudio(id);
+    decodedAudioRef.current.clear();
     audioRefs.current.forEach(audio => {
       audio.pause();
       audio.src = '';
     });
     audioRefs.current.clear();
     
-    audioAnalyzersRef.current.forEach(({ source, analyzer }) => {
+    audioAnalyzersRef.current.forEach(({ source, analyzer, gain }) => {
       try {
         source.disconnect();
         analyzer.disconnect();
+        gain.disconnect();
       } catch { /* 已断开时忽略 */ }
     });
     audioAnalyzersRef.current.clear();
@@ -293,6 +422,7 @@ export default function AudioManager({
 
   // 停止所有音频播�?
   const stopAllAudio = () => {
+    for (const id of bufferPlaybackRef.current.keys()) stopBufferAudio(id);
     audioRefs.current.forEach(audio => {
       if (!audio.paused) {
         audio.pause();
@@ -375,6 +505,10 @@ export default function AudioManager({
     resumeAudioContext,
     registerAudioElement,
     unregisterAudioElement,
+    setAudioGain,
+    prepareAudioBuffer,
+    getDecodedAudioBuffer,
+    syncBufferAudio,
     applyMouthAnimation,
     resetMouthAnimation,
     cleanupAudio,

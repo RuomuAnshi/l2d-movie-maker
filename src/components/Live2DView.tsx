@@ -1,10 +1,21 @@
 // src/components/Live2DView.tsx
-import { startTransition, useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import * as PIXI from "pixi.js";
 import { Live2DModel } from "pixi-live2d-display";
 import { emptyAnimation } from '../animation/types';
-import { animationEnd, combineSourceGroups } from '../animation/engine';
+import { combineSourceGroups } from '../animation/engine';
 import { migrateLegacyClips } from '../animation/migration';
+import { migrateLegacyProject } from '../sequence/migration';
+import { ProjectHistory, sequenceDuration, updateClip, evaluateClipTransform } from '../sequence/engine';
+import { SceneRuntime } from '../sequence/sceneRuntime';
+import { getSceneLipAt } from '../sequence/sceneAudio';
+import { resolveTextSchedule } from '../sequence/text';
+import { materialSourceFromAsset, materialSourceToAsset, parseMaterialSource, type MaterialSource } from '../sequence/materials';
+import type { ProjectDocument } from '../sequence/types';
+import { createClip, createEditSequence } from '../sequence/types';
+import type { ProjectAsset } from '../sequence/types';
+import { syncLegacyMedia } from '../sequence/syncLegacy';
+import { audioGainAt, resolveAudioSchedule } from '../sequence/audio';
 import { readModelDataFromRuntime } from '../utils/modelData';
 import { useTimelineDocument } from '../animation/useTimelineDocument';
 import { bakeLipSync, importMaterial } from '../animation/importers';
@@ -15,6 +26,7 @@ import { parseMotionDurationSeconds } from "../utils/motionDuration";
 import "./Live2DView.css";
 import "./pixel-theme.css";
 import ControlPanel, { type InspectorTab } from "./panel/ControlPanel";
+import SequenceInspector from "./panel/SequenceInspector";
 import ModelManager from "./ModelManager";
 import type { JsonlLive2DModel } from "./ModelManager";
 import AudioManager from "./AudioManager";
@@ -47,6 +59,7 @@ import {
   openProjectBundle,
   saveAutosaveProject,
   storeAudioAsset,
+  storeImageAsset,
   stripRuntimeAudio,
   type ProjectSnapshot,
 } from "../utils/projectStorage";
@@ -77,7 +90,6 @@ const DEFAULT_SUBTITLE_FONT_FAMILY = "Microsoft YaHei";
 const DEFAULT_SUBTITLE_FONT_SIZE = 34;
 const DEFAULT_SUBTITLE_TEXT_COLOR = "#ffffff";
 const AUDIO_WAVEFORM_PEAK_COUNT = 56;
-const AUDIO_END_GUARD_SEC = 0.03;
 
 declare global {
   interface Window {
@@ -96,6 +108,8 @@ export default function Live2DView() {
   const subtitleSpeakerTextRef = useRef<PIXI.Text | null>(null);
   const subtitleSpeakerUnderlineRef = useRef<PIXI.Graphics | null>(null);
   const subtitleTextRef = useRef<PIXI.Text | null>(null);
+  const sceneRuntimeRef = useRef<SceneRuntime | null>(null);
+  const assetBaseRef = useRef<string | null>(null);
 
   // ????jsonl?????????MTN ??????
   const groupContainerRef = useRef<PIXI.Container | null>(null);
@@ -104,6 +118,7 @@ export default function Live2DView() {
 
   // ??????????
   const [assetBase, setAssetBase] = useState<string | null>(null);
+  assetBaseRef.current = assetBase;
 
   // ??????? ???//
   const [modelList, setModelList] = useState<string[]>([]);
@@ -132,6 +147,7 @@ export default function Live2DView() {
   const [subtitleClips, setSubtitleClips] = useState<SubtitleClip[]>([]);
   const { animation, animationRef, changeAnimation, beginEdit, endEdit, undo, redo, resetHistory } = useTimelineDocument(audioClips, subtitleClips, setAudioClips, setSubtitleClips);
   const rendererRef = useRef<TimelineRenderer | null>(null);
+  const registeredAudioUrlsRef = useRef(new Map<string, string>());
   const pendingMigrationRef = useRef<{ motions: Clip[]; expressions: Clip[] } | null>(null);
   const migrationFailedRef = useRef(false);
   // const importingTimelineRef = useRef(false);
@@ -168,6 +184,7 @@ export default function Live2DView() {
 
   // ????? ???//
   const [exportState, setExportState] = useState<"idle" | "done" | "exporting">("idle");
+  const exportInProgressRef = useRef(false);
   const [exportTime, setExportTime] = useState(0);
   const [exportProgress, setExportProgress] = useState(0);
   const [transparentBg, setTransparentBg] = useState(true);
@@ -192,6 +209,128 @@ export default function Live2DView() {
   const characterTransformRef = useRef<CharacterTransform>({ x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0 });
   const characterTransformModeRef = useRef<CharacterTransformMode>("single-relative");
   const isDraggingRef = useRef(false);
+
+  const initialSequenceProject = migrateLegacyProject({
+    selectedModel, selectedCharacterId, characterVisible: isCharacterVisible, characterTransform,
+    animation, motionClips, exprClips, audioClips, subtitleClips, playhead: 0,
+    showSubtitles, showSubtitleSpeaker, subtitleSpeakerAlign,
+  });
+  const [sequenceProject, setSequenceProject] = useState<ProjectDocument>(initialSequenceProject);
+  const sequenceProjectRef = useRef(sequenceProject);
+  sequenceProjectRef.current = sequenceProject;
+  const previewContextRef = useRef<{ sequenceId: string; time: number; rootTime?: number; finalComposition?: boolean; instancePath?: string[] }>({ sequenceId: sequenceProject.rootSequenceId, time: 0 });
+  const [previewSequenceId, setPreviewSequenceId] = useState(sequenceProject.rootSequenceId);
+  const [previewSequenceTime, setPreviewSequenceTime] = useState(0);
+  const [previewFinalComposition, setPreviewFinalComposition] = useState(false);
+  const [navigationResetKey, setNavigationResetKey] = useState(0);
+  const [sequenceSelection, setSequenceSelection] = useState<{ sequenceId: string; clipIds: string[]; actorId?: string }>({ sequenceId: sequenceProject.rootSequenceId, clipIds: [] });
+  const sequenceSelectionRef = useRef(sequenceSelection);
+  sequenceSelectionRef.current = sequenceSelection;
+  const rootPlayheadRef = useRef(0);
+  const libraryPreviewRef = useRef(false);
+  const [selectedProjectAssetId, setSelectedProjectAssetId] = useState<string>();
+  const [projectAssetThumbnails, setProjectAssetThumbnails] = useState<Record<string, string>>({});
+  const previewSeekRevisionRef = useRef(0);
+  const sceneAudioCacheRef = useRef(new WeakMap<ProjectDocument, Map<string, { signature: string; sample: ReturnType<typeof getSceneLipAt> }>>());
+  const audioPreviewSequenceId = previewFinalComposition ? sequenceProject.rootSequenceId : previewSequenceId;
+  const audioSchedule = useMemo(() => resolveAudioSchedule(sequenceProject, audioPreviewSequenceId), [sequenceProject, audioPreviewSequenceId]);
+  const projectGestureRef = useRef<ProjectDocument | null>(null);
+  const canvasEditCancelRef = useRef<(() => void) | null>(null);
+  const legacyMediaSignatureRef = useRef("");
+  const sequenceHistoryRef = useRef<ProjectHistory | null>(null);
+  if (!sequenceHistoryRef.current) sequenceHistoryRef.current = new ProjectHistory(initialSequenceProject);
+  const legacyMediaIdsRef = useRef<{ audio: string[]; subtitles: string[] }>({ audio: [], subtitles: [] });
+  function syncLegacyMediaFromSequence(document: ProjectDocument) {
+    const root = document.sequences[document.rootSequenceId];
+    if (!root) return;
+    const rootClips = root.tracks.flatMap((track) => track.clips);
+    setAudioClips((previous) => {
+      const nextAudio = rootClips.filter((clip) => clip.kind === "audio" && clip.assetId === `asset:audio:${clip.id}`).map((clip) => {
+      const old = previous.find((item) => item.id === clip.id);
+      const asset = clip.assetId ? document.assets[clip.assetId] : undefined;
+      return { ...(old ?? {}), id: clip.id, name: clip.name, start: clip.start, duration: clip.duration, audioPath: asset?.uri || old?.audioPath, audioSourceDuration: asset?.duration ?? old?.audioSourceDuration, sourceIn: clip.sourceIn, playbackRate: clip.rate, gain: clip.volume, fadeIn: clip.fadeIn, fadeOut: clip.fadeOut } as Clip;
+      });
+      return previous.length === nextAudio.length && previous.every((item, index) => item.id === nextAudio[index].id && item.name === nextAudio[index].name && item.start === nextAudio[index].start && item.duration === nextAudio[index].duration && item.audioPath === nextAudio[index].audioPath && item.sourceIn === nextAudio[index].sourceIn && item.playbackRate === nextAudio[index].playbackRate && item.gain === nextAudio[index].gain && item.fadeIn === nextAudio[index].fadeIn && item.fadeOut === nextAudio[index].fadeOut) ? previous : nextAudio;
+    });
+    setSubtitleClips((previous) => {
+      const nextSubtitles = rootClips.filter((clip) => clip.kind === "text" && clip.assetId === `asset:text:${clip.id}`).map((clip) => {
+      const old = previous.find((item) => item.id === clip.id);
+      const asset = clip.assetId ? document.assets[clip.assetId] : undefined;
+      return {
+        ...(old ?? {}), id: clip.id, name: clip.name, start: clip.start, duration: clip.duration,
+        subtitleText: clip.text ?? old?.subtitleText ?? "", fontFamily: String(asset?.metadata?.fontFamily ?? old?.fontFamily ?? DEFAULT_SUBTITLE_FONT_FAMILY),
+        fontSize: Number(asset?.metadata?.fontSize ?? old?.fontSize ?? DEFAULT_SUBTITLE_FONT_SIZE), textColor: String(asset?.metadata?.color ?? old?.textColor ?? DEFAULT_SUBTITLE_TEXT_COLOR),
+      } as SubtitleClip;
+      });
+      return previous.length === nextSubtitles.length && previous.every((item, index) => item.id === nextSubtitles[index].id && item.start === nextSubtitles[index].start && item.duration === nextSubtitles[index].duration && item.subtitleText === nextSubtitles[index].subtitleText) ? previous : nextSubtitles;
+    });
+  }
+  const reconcilePreviewContext = (document: ProjectDocument) => {
+    if (document.sequences[previewContextRef.current.sequenceId]) return;
+    const time = Math.min(rootPlayheadRef.current, sequenceDuration(document.sequences[document.rootSequenceId]));
+    previewContextRef.current = { sequenceId: document.rootSequenceId, time };
+    playheadRef.current = time;
+    rootPlayheadRef.current = time;
+    setPlayhead(time);
+    setPreviewSequenceId(document.rootSequenceId);
+    setPreviewSequenceTime(time);
+    setPreviewFinalComposition(false);
+    setSequenceSelection({ sequenceId: document.rootSequenceId, clipIds: [] });
+  };
+  const changeSequenceProject = (next: ProjectDocument) => {
+    const committed = projectGestureRef.current ? next : sequenceHistoryRef.current!.execute(() => next);
+    sequenceProjectRef.current = committed;
+    reconcilePreviewContext(committed);
+    sceneRuntimeRef.current?.setProject(committed);
+    setSequenceProject(committed);
+    syncLegacyMediaFromSequence(committed);
+  };
+  const beginProjectEdit = () => { if (!projectGestureRef.current) projectGestureRef.current = sequenceProjectRef.current; };
+  const endProjectEdit = () => {
+    if (!projectGestureRef.current) return;
+    const final = sequenceProjectRef.current;
+    const before = projectGestureRef.current;
+    projectGestureRef.current = null;
+    sequenceHistoryRef.current!.replaceCurrent(before);
+    sequenceHistoryRef.current!.execute(() => final);
+  };
+  const undoSequenceProject = () => {
+    canvasEditCancelRef.current?.();
+    endProjectEdit();
+    const next = sequenceHistoryRef.current!.undo();
+    sequenceProjectRef.current = next;
+    reconcilePreviewContext(next);
+    sceneRuntimeRef.current?.setProject(next);
+    setSequenceProject(next);
+    syncLegacyMediaFromSequence(next);
+  };
+  const redoSequenceProject = () => {
+    canvasEditCancelRef.current?.();
+    endProjectEdit();
+    const next = sequenceHistoryRef.current!.redo();
+    sequenceProjectRef.current = next;
+    reconcilePreviewContext(next);
+    sceneRuntimeRef.current?.setProject(next);
+    setSequenceProject(next);
+    syncLegacyMediaFromSequence(next);
+  };
+
+  useEffect(() => {
+    if (!projectHydrated) return;
+    const signature = JSON.stringify({ audio: audioClips.map(stripRuntimeAudio), subtitles: subtitleClips.map(stripRuntimeAudio) });
+    if (signature === legacyMediaSignatureRef.current) return;
+    legacyMediaSignatureRef.current = signature;
+    const current = sequenceProjectRef.current;
+    const ids = legacyMediaIdsRef.current;
+    const next = syncLegacyMedia(current, audioClips, subtitleClips, { previousAudioIds: ids.audio, previousSubtitleIds: ids.subtitles });
+    legacyMediaIdsRef.current = { audio: audioClips.map((clip) => clip.id), subtitles: subtitleClips.map((clip) => clip.id) };
+    if (next !== current) changeSequenceProject(next);
+  }, [audioClips, subtitleClips, projectHydrated]);
+
+  useEffect(() => {
+    sceneRuntimeRef.current?.setProject(sequenceProject);
+    if (!isPlayingRef.current) void applyTimelineAtTime(previewContextRef.current.time);
+  }, [sequenceProject]);
 
   const handleDraggingChange = (dragging: boolean) => {
     isDraggingRef.current = dragging;
@@ -566,12 +705,6 @@ export default function Live2DView() {
     linkedAudioClipId: options.linkedAudioClipId,
   });
 
-  const getAudioAudibleDuration = (clip: Clip) =>
-    Math.min(
-      Math.max(0, Number(clip.duration) || 0),
-      Math.max(0, Number(clip.audioSourceDuration ?? clip.duration) || 0),
-    );
-
   const buildWaveformPeaks = (buffer: AudioBuffer, peakCount = AUDIO_WAVEFORM_PEAK_COUNT) => {
     const channelData = buffer.getChannelData(0);
     if (channelData.length === 0) return [];
@@ -629,16 +762,6 @@ export default function Live2DView() {
 
   const resetTimelineDisplayCache = () => {
     activeSubtitleSignatureRef.current = "";
-  };
-
-  const findActiveClip = (clips: Clip[], timeSec: number): Clip | null => {
-    for (let i = clips.length - 1; i >= 0; i -= 1) {
-      const clip = clips[i];
-      if (timeSec >= clip.start && timeSec < clip.start + clip.duration) {
-        return clip;
-      }
-    }
-    return null;
   };
 
   const syncSubtitleDisplayLayout = () => {
@@ -881,6 +1004,12 @@ export default function Live2DView() {
   };
 
   const setPlayheadSec = (sec: number) => {
+    previewContextRef.current = { sequenceId: sequenceProjectRef.current.rootSequenceId, time: sec };
+    rootPlayheadRef.current = sec;
+    libraryPreviewRef.current = false;
+    setPreviewSequenceId(sequenceProjectRef.current.rootSequenceId);
+    setPreviewSequenceTime(sec);
+    setPreviewFinalComposition(false);
     playheadRef.current = sec;
     playheadUiLastTsRef.current = null;
     resetTimelineDisplayCache();
@@ -902,35 +1031,105 @@ export default function Live2DView() {
     });
   };
 
-  const prepareMaterial = async (name: string, kind: 'motion' | 'expression', start: number) => {
+  const materialModelOrigin = () => externalModelPathRef.current ?? selectedModel ?? modelUrl ?? "";
+  const makeMaterialSource = (name: string, kind: 'motion' | 'expression', adapters: ModelAdapter[], characterId = selectedCharacterId): MaterialSource | undefined => {
+    const sourceModel = materialModelOrigin();
+    const id = `asset:material:${encodeURIComponent(sourceModel)}:${encodeURIComponent(characterId)}:${kind}:${encodeURIComponent(name)}`;
+    const asset = sequenceProjectRef.current.assets[id];
+    const saved = asset ? materialSourceFromAsset(asset) : null;
+    if (saved) return saved;
+    const parts = adapters.filter((adapter) => String(adapter.model.__characterId ?? "main") === characterId).flatMap((adapter) => {
+      const data = readModelDataFromRuntime(adapter.model);
+      const present = kind === "motion" ? !!data?.motions[name] : data?.expressions.some((item) => item.name === name);
+      return present ? [adapter.materialReference(name, kind)] : [];
+    });
+    return parts.length ? { id, name, kind, sourceModel, parts } : undefined;
+  };
+  const getMaterialSource = (name: string, kind: 'motion' | 'expression') => makeMaterialSource(name, kind, rendererRef.current?.adapters ?? []);
+  const loadMaterialSource = async (source: MaterialSource): Promise<MaterialSource> => {
+    const checked = parseMaterialSource(source);
+    if (!checked) throw new Error("动作或表情的来源无效，请重新拖入素材。");
+    return { ...checked, parts: await Promise.all(checked.parts.map(async (part) => {
+      if (part.text !== undefined) return part;
+      const response = await fetch(part.uri);
+      if (!response.ok) throw new Error(`素材读取失败：${checked.name} (${response.status})`);
+      return { ...part, text: await response.text() };
+    })) };
+  };
+  const cacheLibraryMaterials = async (adapters: ModelAdapter[]) => {
+    const projectId = sequenceProjectRef.current.id;
+    const characters = [...new Set(adapters.map((adapter) => String(adapter.model.__characterId ?? "main")))];
+    const sources = characters.flatMap((character) => {
+      const matching = adapters.filter((adapter) => String(adapter.model.__characterId ?? "main") === character);
+      const motionNames = new Set(matching.flatMap((adapter) => Object.keys(readModelDataFromRuntime(adapter.model)?.motions ?? {})));
+      const expressionNames = new Set(matching.flatMap((adapter) => readModelDataFromRuntime(adapter.model)?.expressions.map((item) => item.name) ?? []));
+      return [...[...motionNames].map((name) => makeMaterialSource(name, "motion", adapters, character)), ...[...expressionNames].map((name) => makeMaterialSource(name, "expression", adapters, character))].filter((source): source is MaterialSource => !!source && !sequenceProjectRef.current.assets[source.id]);
+    });
+    const results = await Promise.allSettled(sources.map(loadMaterialSource));
+    const current = sequenceProjectRef.current;
+    if (current.id !== projectId) return;
+    const assets = { ...current.assets };
+    let changed = false;
+    for (const result of results) {
+      if (result.status === "fulfilled") { assets[result.value.id] = materialSourceToAsset(result.value); changed = true; }
+      else console.warn("读取素材来源失败", result.reason);
+    }
+    if (!changed) return;
+    const next = { ...current, assets };
+    sequenceProjectRef.current = next;
+    sequenceHistoryRef.current?.replaceCurrent(next);
+    setSequenceProject(next);
+  };
+  const prepareMaterial = async (name: string, kind: 'motion' | 'expression', start: number, base = animationRef.current, targetAdapters?: ModelAdapter[], source?: MaterialSource) => {
     const renderer = rendererRef.current;
-    const adapters = renderer?.adapters.filter(a => {
+    const adapters = targetAdapters ?? renderer?.adapters.filter(a => {
       if (String(a.model.__characterId ?? 'main') !== selectedCharacterId) return false;
+      if (source) return true;
       const data = readModelDataFromRuntime(a.model);
       return kind === 'motion' ? !!data?.motions[name] : data?.expressions.some(e => e.name === name);
     }) ?? [];
     if (!adapters.length) throw new Error('当前角色中没有对应素材，请先加载模型');
-    const materials = await Promise.all(adapters.map(async adapter => ({ adapter, text: await adapter.material(name, kind) })));
-    if (rendererRef.current !== renderer) throw new Error('模型已改变，请重新导入素材');
-    let next = animationRef.current;
+    const selectedSource = source ?? getMaterialSource(name, kind);
+    if (!selectedSource) throw new Error("没有可读取的素材来源，请先在素材库选择模型。");
+    const resolved = await loadMaterialSource(selectedSource);
+    if (resolved.name !== name || resolved.kind !== kind) throw new Error("素材名称或类型与来源不一致，请重新拖入。");
+    const materials = resolved.parts.map((part) => {
+      const adapter = adapters.find((item) => item.tracks[0]?.definition.partId === part.partId || String(item.model.__jsonlRoleMeta?.index ?? item.index) === part.partId)
+        ?? (resolved.parts.length === 1 && adapters.length === 1 ? adapters[0] : undefined);
+      if (!adapter) throw new Error(`目标模型缺少素材部件：${part.partId}`);
+      return { adapter, text: part.text! };
+    });
+    if (!targetAdapters && rendererRef.current !== renderer) throw new Error('模型已改变，请重新导入素材');
+    let next = base;
     const oldIds = new Set(next.groups.map(g => g.id));
-    for (const {adapter, text} of materials) next = importMaterial(next, next.tracks.filter(t => adapter.tracks.some(a => a.definition.target === t.definition.target)), text, kind, name, start);
-    return combineSourceGroups(next, next.groups.filter(g => !oldIds.has(g.id)).map(g => g.id));
+    for (const {adapter, text} of materials) {
+      const known = new Set(next.tracks.map((track) => track.definition.target));
+      const missingTracks = adapter.tracks.filter((track) => !known.has(track.definition.target));
+      const importTracks = [...next.tracks.filter((track) => adapter.tracks.some((item) => item.definition.target === track.definition.target)), ...missingTracks];
+      next = { ...next, tracks: [...next.tracks, ...missingTracks] };
+      next = importMaterial(next, importTracks, text, kind, name, start);
+    }
+    next = combineSourceGroups(next, next.groups.filter(g => !oldIds.has(g.id)).map(g => g.id));
+    return { ...next, groups: next.groups.map((group) => oldIds.has(group.id) ? group : { ...group, sourceAssetId: resolved.id }) };
   };
-  const addMaterial = async (name: string, kind: 'motion' | 'expression', start = playheadRef.current) => {
+  const addMaterial = async (name: string, kind: 'motion' | 'expression', start = playheadRef.current, source?: MaterialSource) => {
     if (!name) return;
-    try {
-      const next = await prepareMaterial(name, kind, start);
-      stopPlayback();
-      beginEdit(); changeAnimation(next); endEdit();
-      if (kind === 'motion') setCurrentMotion(name); else setCurrentExpression(name);
-    } catch (error) { showAlert(`导入失败：${error instanceof Error ? error.message : String(error)}`); }
+    const project = sequenceProjectRef.current;
+    const active = project.sequences[previewContextRef.current.sequenceId];
+    if (active?.kind === "live2d") { await importMaterialIntoSequence(active.id, name, kind, start, source); return; }
+    const selected = active?.tracks.flatMap((track) => track.clips).find((clip) => sequenceSelection.clipIds.includes(clip.id) && clip.sequenceId && project.sequences[clip.sequenceId]?.kind === "live2d");
+    if (!selected?.sequenceId) { showAlert("请选中 Live2D 片段，或进入内部编辑。"); return; }
+    await importMaterialIntoSequence(selected.sequenceId, name, kind, selected.sourceIn + Math.max(0, start - selected.start) * selected.rate, source);
   };
-  const previewMaterial = async (name: string, kind: 'motion' | 'expression') => {
+  const previewMaterial = async (name: string, kind: 'motion' | 'expression', source?: MaterialSource) => {
     try {
       stopPlayback();
+      libraryPreviewRef.current = true;
+      if (!source) setSelectedProjectAssetId(undefined);
+      sceneRuntimeRef.current?.setVisible(false);
+      setModelVisibility(true);
       const start = playheadRef.current;
-      const document = await prepareMaterial(name, kind, start);
+      const document = await prepareMaterial(name, kind, start, animationRef.current, undefined, source);
       const duration = Math.max(0.1, ...document.groups.filter(g => !animationRef.current.groups.some(old => old.id === g.id)).map(g => g.duration));
       const started = performance.now();
       const frame = (now: number) => {
@@ -938,13 +1137,39 @@ export default function Live2DView() {
         rendererRef.current?.seek(document, start+offset);
         if (appRef.current) appRef.current.renderer.render(appRef.current.stage);
         if (offset < duration) previewRafRef.current=requestAnimationFrame(frame);
-        else { previewRafRef.current=null; applyTimelineAtTime(playheadRef.current); }
+        else { previewRafRef.current=null; }
       };
       previewRafRef.current = requestAnimationFrame(frame);
     } catch (error) { showAlert(`预览失败：${error instanceof Error ? error.message : String(error)}`); }
   };
+  const previewMaterialSource = (source: MaterialSource) => previewMaterial(source.name, source.kind, source);
   const addMotionClip = (name: string) => addMaterial(name, 'motion');
   const addExprClip = (name: string) => addMaterial(name, 'expression');
+
+  const importMaterialIntoSequence = async (sequenceId: string, name: string, kind: "motion" | "expression", start: number, source?: MaterialSource) => {
+    let project = sequenceProjectRef.current;
+    let target = project.sequences[sequenceId];
+    if (!target || target.kind !== "live2d") return;
+    try {
+      await sceneRuntimeRef.current?.prepareSequence(sequenceId, false, start);
+      project = sequenceProjectRef.current;
+      target = project.sequences[sequenceId];
+      if (target?.kind !== "live2d") return;
+      const selectedSource = source ?? getMaterialSource(name, kind);
+      if (!selectedSource) throw new Error("没有可读取的素材来源，请从素材库重新拖入。");
+      const resolvedSource = await loadMaterialSource(selectedSource);
+      const adapters = sceneRuntimeRef.current?.getAdapters(sequenceId) ?? [];
+      const sourceAnimation = target.animation;
+      const nextAnimation = await prepareMaterial(name, kind, start, sourceAnimation, adapters, resolvedSource);
+      project = sequenceProjectRef.current;
+      target = project.sequences[sequenceId];
+      if (target?.kind !== "live2d" || target.animation !== sourceAnimation) throw new Error("动画已改变，请重新拖入素材。");
+      const nextProject = { ...project, assets: { ...project.assets, [resolvedSource.id]: materialSourceToAsset(resolvedSource) }, sequences: { ...project.sequences, [sequenceId]: { ...target, animation: nextAnimation } } };
+      stopPlayback();
+      changeSequenceProject(nextProject);
+      if (kind === "motion") setCurrentMotion(name); else setCurrentExpression(name);
+    } catch (error) { showAlert(`导入失败：${error instanceof Error ? error.message : String(error)}`); }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -956,7 +1181,7 @@ export default function Live2DView() {
         await Promise.all(adapters.map(adapter => adapter.metadata().catch(error => console.warn('参数名称读取失败', error))));
         if (cancelled) return;
         rendererRef.current = new TimelineRenderer(adapters);
-        const current = animationRef.current;
+        const current = pendingMigrationRef.current ? animationRef.current : emptyAnimation();
         const tracks = adapters.flatMap(a => a.tracks).map(track => {
           const saved = current.tracks.find(t => t.definition.target === track.definition.target);
           return saved ? { ...saved, definition: track.definition } : track;
@@ -973,9 +1198,18 @@ export default function Live2DView() {
           migrationFailedRef.current = false;
           setAnimationIssue(null);
           setMotionClips([]); setExprClips([]);
+          const project = sequenceProjectRef.current;
+          const main = project.sequences["sequence:live2d:main"];
+          if (main?.kind === "live2d") {
+            const modelAsset = project.assets["asset:model:main"];
+            const metadata = { ...modelAsset?.metadata };
+            delete metadata.legacyMotions; delete metadata.legacyExpressions;
+            changeSequenceProject({ ...project, assets: { ...project.assets, ["asset:model:main"]: { ...modelAsset, metadata } }, sequences: Object.fromEntries(Object.entries(project.sequences).map(([id, sequence]) => [id, id === main.id ? { ...main, animation: next } : { ...sequence, tracks: sequence.tracks.map((track) => ({ ...track, clips: track.clips.map((clip) => clip.sequenceId === main.id ? { ...clip, placeholder: undefined } : clip) })) }])) });
+          }
         }
         if (!cancelled) {
           changeAnimation(next);
+          void cacheLibraryMaterials(adapters).catch((error) => console.warn("整理模型素材失败", error));
           const restored = restoringProjectRef.current;
           if (restored) {
             characterTransformModeRef.current = restored.characterTransformMode;
@@ -999,136 +1233,254 @@ export default function Live2DView() {
   };
 
   const syncPreviewAudioAtTime = (timeSec: number) => {
-    audioClips.forEach((clip) => {
-      const audioElement = audioManager.audioRefs.current.get(clip.id);
-      if (!audioElement) return;
+    audioManager.syncBufferAudio(audioSchedule.map((clip) => {
+      const elapsed = timeSec - clip.start;
+      return {
+        id: clip.id, assetId: clip.assetId,
+        sourceTime: clip.sourceIn + Math.max(0, elapsed) * clip.rate,
+        rate: clip.rate, gain: clip.muted ? 0 : audioGainAt(clip, elapsed),
+        active: !clip.muted && elapsed >= 0 && elapsed < clip.duration,
+        remainingDuration: clip.duration - elapsed,
+      };
+    }), isPlayingRef.current);
+  };
 
-      const audibleDuration = getAudioAudibleDuration(clip);
-      const playbackCeiling = Math.max(0, audibleDuration - AUDIO_END_GUARD_SEC);
-      if (audibleDuration <= 0) {
-        if (!audioElement.paused) {
-          audioElement.pause();
-        }
-        audioElement.currentTime = 0;
+  const prepareSequenceAudio = async (sequenceId: string, strict = false) => {
+    const project = sequenceProjectRef.current;
+    const schedule = resolveAudioSchedule(project, sequenceId);
+    await Promise.all([...new Set(schedule.map((item) => item.assetId))].map(async (assetId) => {
+      const asset = project.assets[assetId];
+      if (!asset?.uri || asset.missing || asset.uri.startsWith("bundle:")) {
+        if (strict) throw new Error(`缺少音频素材：${asset?.name ?? assetId}`);
+        setAnimationIssue(`缺少音频素材：${asset?.name ?? assetId}，请在素材库替换。`);
         return;
       }
-
-      const clipOffset = timeSec - clip.start;
-      if (!isPlayingRef.current) {
-        audioElement.pause();
-        audioElement.currentTime = Math.max(0, Math.min(clipOffset, playbackCeiling));
-        return;
-      }
-      if (clipOffset >= 0 && clipOffset < playbackCeiling) {
-        const playbackTime = Math.max(0, Math.min(clipOffset, playbackCeiling));
-        if (audioElement.paused) {
-          audioElement.currentTime = playbackTime;
-          audioElement.play().catch((error) => {
-            console.warn("音频播放失败", error);
-          });
-        } else if (Math.abs(audioElement.currentTime - playbackTime) > 0.25) {
-          audioElement.currentTime = playbackTime;
-        }
-        return;
-      }
-
-      if (!audioElement.paused) {
-        audioElement.pause();
-      }
-      audioElement.currentTime = 0;
-    });
+      const url = /^(?:https?:|blob:|data:)/.test(asset.uri) ? asset.uri : await buildExternalAssetUrl(await dirname(asset.uri), asset.uri);
+      const buffer = await audioManager.prepareAudioBuffer(assetId, url);
+      if (asset.lipSync && asset.waveformPeaks) return;
+      const analysis = { lipSync: bakeLipSync(buffer), lipSyncSampleRate: 120, waveformPeaks: buildWaveformPeaks(buffer), duration: buffer.duration };
+      const current = sequenceProjectRef.current;
+      if (current.assets[assetId]?.uri !== asset.uri) return;
+      const next = { ...current, assets: { ...current.assets, [assetId]: { ...current.assets[assetId], ...analysis } } };
+      sequenceProjectRef.current = next;
+      sequenceHistoryRef.current?.replaceCurrent(next);
+      setSequenceProject(next);
+    }));
   };
 
   // ????????
-  const addAudioClip = async () => {
+  const importProjectAudioAsset = async () => {
     try {
-      audioManager.initAudioContext();
-
-      const picked = await open({
-        multiple: false,
-        filters: [{ name: "Audio", extensions: ["wav", "mp3", "ogg", "m4a"] }]
-      });
-      if (!picked) return;
-      const audioPath = Array.isArray(picked) ? picked[0] : picked;
-      if (!audioPath) return;
-
-      const managedAudioPath = await storeAudioAsset(audioPath);
-      const audioUrl = await buildExternalAssetUrl(await dirname(managedAudioPath), managedAudioPath);
+      const picked = await open({ multiple: false, filters: [{ name: "音频", extensions: ["wav", "mp3", "ogg", "m4a"] }] });
+      if (typeof picked !== "string") return;
+      const managedPath = await storeAudioAsset(picked);
+      const audioUrl = await buildExternalAssetUrl(await dirname(managedPath), managedPath);
       const audio = new Audio(audioUrl);
       audio.crossOrigin = "anonymous";
-      await new Promise((resolve, reject) => {
-        audio.onloadedmetadata = resolve;
-        audio.onerror = reject;
-        audio.load();
-      });
-
-      const duration = audio.duration;
-      if (duration <= 0) {
-        showAlert("音频加载失败");
-        return;
-      }
-
-      const fileName = audioPath.split(/[\\/]/).pop() ?? "audio";
-      const clipName = fileName.replace(/\.[^/.]+$/, '');
-
-      const audioClip: Clip = {
-        id: crypto.randomUUID(),
-        name: clipName,
-        start: nextEnd(audioClips),
-        duration,
-        audioSourceDuration: duration,
-        audioUrl,
-        audioPath: managedAudioPath
-      };
-
-      const audioMeta = await analyzeAudioSource(audioUrl, duration);
-      audioClip.audioSourceDuration = audioMeta.audioSourceDuration;
-      audioClip.waveformPeaks = audioMeta.waveformPeaks;
-      audioClip.lipSync = audioMeta.lipSync;
-
-      registerAudioElement(audioClip.id, audioUrl);
-
-      beginEdit();
-      setAudioClips(prev => [...prev, audioClip]);
-      endEdit(true);
-    } catch (error) {
-      console.error('音频加载失败:', error);
-      showAlert("音频加载失败: " + String(error));
-    }
+      await new Promise<void>((resolve, reject) => { audio.onloadedmetadata = () => resolve(); audio.onerror = () => reject(new Error("无法读取音频信息")); audio.load(); });
+      const name = picked.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, "") || "音频";
+      const id = `asset:audio:${crypto.randomUUID()}`;
+      const project = sequenceProjectRef.current;
+      changeSequenceProject({ ...project, assets: { ...project.assets, [id]: { id, kind: "audio", name, uri: managedPath, duration: audio.duration } } });
+    } catch (error) { showAlert(`导入音频失败：${error instanceof Error ? error.message : String(error)}`); }
   };
 
-  const timelineLength = Math.max(nextEnd(motionClips), nextEnd(exprClips), nextEnd(audioClips), nextEnd(subtitleClips), animationEnd(animation), 0);
+  const importProjectImageAsset = async () => {
+    try {
+      const picked = await open({ multiple: false, filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }] });
+      if (typeof picked !== "string") return;
+      const managedPath = await storeImageAsset(picked);
+      const imageUrl = await buildExternalAssetUrl(await dirname(managedPath), managedPath);
+      const image = new Image();
+      image.src = imageUrl;
+      await image.decode();
+      const name = picked.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, "") || "图片";
+      const id = `asset:image:${crypto.randomUUID()}`;
+      const project = sequenceProjectRef.current;
+      changeSequenceProject({ ...project, assets: { ...project.assets, [id]: { id, kind: "image", name, uri: managedPath, width: image.naturalWidth, height: image.naturalHeight } } });
+    } catch (error) { showAlert(`导入图片失败：${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all(Object.values(sequenceProject.assets).filter((asset) => (asset.kind === "image" || asset.kind === "audio") && asset.uri && !asset.missing && !asset.uri.startsWith("bundle:")).map(async (asset) => {
+      try { return [asset.id, /^(?:https?:|blob:|data:)/.test(asset.uri) ? asset.uri : await buildExternalAssetUrl(await dirname(asset.uri), asset.uri)] as const; }
+      catch { return null; }
+    })).then((entries) => { if (!cancelled) setProjectAssetThumbnails(Object.fromEntries(entries.filter((entry) => entry !== null))); });
+    return () => { cancelled = true; };
+  }, [sequenceProject.assets]);
+
+  const previewProjectAsset = async (asset: ProjectAsset) => {
+    stopPlayback(); libraryPreviewRef.current = true; setSelectedProjectAssetId(asset.id); setModelVisibility(false);
+    try {
+      if (asset.missing) { showAlert("素材缺失，请点击替换。"); return; }
+      const project = sequenceProjectRef.current;
+      const runtime = sceneRuntimeRef.current;
+      if (!runtime) return;
+      if (asset.kind === "motion" || asset.kind === "expression") {
+        const source = materialSourceFromAsset(asset);
+        if (!source) throw new Error("该素材的来源数据无效。");
+        sceneRuntimeRef.current?.setVisible(false);
+        await previewMaterialSource(source);
+        return;
+      }
+      if (asset.kind === "sequence" && typeof asset.metadata?.sequenceId === "string") {
+        runtime.setProject(project); await runtime.seekSceneAt(asset.metadata.sequenceId, 0, { lipAt: getSceneLipAt(project, asset.metadata.sequenceId) }); return;
+      }
+      if (asset.kind === "audio") { runtime.setVisible(false); return; }
+      const sequence = createEditSequence("素材预览", { width: project.width, height: project.height, fps: project.fps });
+      sequence.tracks[0].clips = [createClip({ kind: asset.kind === "text" ? "text" : "image", name: asset.name, assetId: asset.id, text: asset.name, start: 0, duration: 5 })];
+      const preview = { ...project, sequences: { ...project.sequences, [sequence.id]: sequence } };
+      runtime.setProject(preview); await runtime.seekSceneAt(sequence.id, 0);
+    } catch (error) { showAlert(`素材预览失败：${String(error)}`); }
+  };
+
+  const repairProjectAsset = async (assetId: string) => {
+    const sourceProject = sequenceProjectRef.current;
+    const asset = sourceProject.assets[assetId];
+    if (!asset) return;
+    try {
+      const picked = await open({ multiple: false, title: `替换 ${asset.name}`, filters: [{ name: "素材", extensions: asset.kind === "live2d" ? ["json", "jsonl", "zip"] : asset.kind === "audio" ? ["wav", "mp3", "ogg", "m4a"] : ["png", "jpg", "jpeg", "webp", "gif"] }] });
+      if (typeof picked !== "string") return;
+      let uri: string, duration = asset.duration;
+      if (asset.kind === "live2d") {
+        if (!modelRoot) throw new Error("模型库尚未就绪。");
+        const imported = await importModelSource(picked, modelRoot);
+        const models = await invoke<string[]>("refresh_model_index");
+        const paths = models.filter((path) => path.startsWith(`${imported.id}/`));
+        const preferred = picked.split(/[\\/]/).pop();
+        const relative = paths.find((path) => path.endsWith(`/${preferred}`)) ?? paths[0];
+        if (!relative) throw new Error("没有找到模型配置。");
+        uri = await join(modelRoot, relative);
+        const packages = [...modelPackages, { ...imported, modelPaths: paths }];
+        await saveModelPackages(packages); setModelPackages(packages); setModelList(models);
+      } else if (asset.kind === "audio") {
+        uri = await storeAudioAsset(picked);
+        const url = await buildExternalAssetUrl(await dirname(uri), uri);
+        duration = (await audioManager.prepareAudioBuffer(assetId, url)).duration;
+      } else uri = await storeImageAsset(picked);
+      const project = sequenceProjectRef.current;
+      if (project.id !== sourceProject.id || project.assets[assetId]?.uri !== asset.uri) return;
+      const assets = { ...project.assets, [assetId]: { ...project.assets[assetId], uri, duration, missing: false, lipSync: undefined, waveformPeaks: undefined } };
+      const sequences = Object.fromEntries(Object.entries(project.sequences).map(([id, sequence]) => [id, { ...sequence, tracks: sequence.tracks.map((track) => ({ ...track, clips: track.clips.map((clip) => {
+        const child = clip.sequenceId ? project.sequences[clip.sequenceId] : undefined;
+        const repairedChild = child?.kind === "live2d" && child.actors.some((actor) => actor.assetId === assetId) && child.actors.every((actor) => {
+          const model = assets[actor.assetId];
+          return model && !model.missing && !!model.uri && !model.metadata?.legacyMotions;
+        });
+        return clip.assetId === assetId || repairedChild ? { ...clip, placeholder: undefined } : clip;
+      }) })) }]));
+      changeSequenceProject({ ...project, sequences, assets });
+      if (assetId === "asset:model:main" && pendingMigrationRef.current) {
+        externalModelPathRef.current = uri;
+        setExternalModelUrl(await buildExternalAssetUrl(await dirname(uri), uri));
+        setProjectRevision((revision) => revision + 1);
+      }
+      setAnimationIssue(null);
+    } catch (error) { showAlert(`替换素材失败：${String(error)}`); }
+  };
+
+  const timelineLength = sequenceDuration(sequenceProject.sequences[sequenceProject.rootSequenceId]);
+
+  const mapSequenceTimeToRoot = (time: number, sequenceId: string, instancePath?: string[]) => {
+    const project = sequenceProjectRef.current;
+    if (sequenceId === project.rootSequenceId) return time;
+    let sequence = project.sequences[project.rootSequenceId];
+    const clips: import("../sequence/types").Clip[] = [];
+    for (const id of instancePath ?? []) {
+      const clip = sequence?.tracks.flatMap((track) => track.clips).find((clip) => clip.id === id);
+      if (!clip?.sequenceId) return undefined;
+      clips.push(clip); sequence = project.sequences[clip.sequenceId];
+    }
+    if (sequence?.id !== sequenceId) return undefined;
+    let result = time;
+    for (const clip of clips.reverse()) {
+      if (result < clip.sourceIn || result >= clip.sourceIn + clip.duration * clip.rate) return undefined;
+      result = clip.start + (result - clip.sourceIn) / clip.rate;
+    }
+    return result;
+  };
+
+  const seekSequence = (sequenceId: string, time: number, context: { rootTime?: number; finalComposition?: boolean; instancePath?: string[] } = {}) => {
+    if (sequenceId !== previewContextRef.current.sequenceId) canvasEditCancelRef.current?.();
+    previewContextRef.current = { sequenceId, time, ...context };
+    libraryPreviewRef.current = false;
+    setPreviewSequenceId(sequenceId);
+    setPreviewSequenceTime(time);
+    setPreviewFinalComposition(!!context.finalComposition);
+    playheadRef.current = time;
+    if (sequenceId === sequenceProjectRef.current.rootSequenceId) { rootPlayheadRef.current = time; setPlayhead(time); }
+    void applyTimelineAtTime(time);
+  };
 
   useEffect(() => {
     if (!projectHydrated) return;
-    for (const clip of audioClips) {
-      if (clip.audioUrl && !audioManager.audioRefs.current.has(clip.id)) {
-        registerAudioElement(clip.id, clip.audioUrl);
+    let cancelled = false;
+    const wanted = new Set(audioSchedule.map((item) => item.id));
+    for (const registeredId of registeredAudioUrlsRef.current.keys()) {
+      if (!wanted.has(registeredId)) {
+        audioManager.unregisterAudioElement(registeredId);
+        registeredAudioUrlsRef.current.delete(registeredId);
       }
     }
-  }, [projectHydrated, audioClips]);
+    void Promise.all(audioSchedule.map(async (item) => {
+      const asset = sequenceProject.assets[item.assetId];
+      if (!asset?.uri || asset.uri.startsWith("bundle:") || asset.missing) return;
+      try {
+        const audioUrl = await buildExternalAssetUrl(await dirname(asset.uri), asset.uri);
+        if (cancelled || registeredAudioUrlsRef.current.get(item.id) === audioUrl) return;
+        registerAudioElement(item.id, audioUrl);
+        registeredAudioUrlsRef.current.set(item.id, audioUrl);
+      } catch (error) { console.warn(`音频素材“${asset.name}”无法加载`, error); }
+    })).then(() => {
+      if (cancelled) return;
+      syncPreviewAudioAtTime(playheadRef.current);
+      if (appRef.current) appRef.current.renderer.render(appRef.current.stage);
+    });
+    return () => { cancelled = true; };
+  }, [projectHydrated, audioSchedule, sequenceProject.assets]);
 
-  const applyTimelineAtTime = (t: number, offline: boolean = false, document = animationRef.current) => {
-    const lipAt = (time: number) => Math.max(0, ...audioClips.map(clip => {
-      const offset = time - clip.start;
-      return offset >= 0 && offset < getAudioAudibleDuration(clip) ? (clip.lipSync?.[Math.floor(offset * 120)] ?? 0) : 0;
-    }));
-    rendererRef.current?.seek(document, t, lipAt, audioClips);
-    setCurrentAudioLevel(lipAt(t) * 100);
-    renderSubtitleClip(findActiveClip(subtitleClips, t) as SubtitleClip | null);
+  useEffect(() => {
+    if (!projectHydrated) return;
+    void prepareSequenceAudio(audioPreviewSequenceId).catch((error) => setAnimationIssue(String(error)));
+  }, [projectHydrated, audioSchedule, audioPreviewSequenceId]);
 
-    if (!offline) {
-      syncPreviewAudioAtTime(t);
-
+  const applyTimelineAtTime = async (t: number, offline = false, mode: VideoExportMode = "all") => {
+    if (!offline && exportInProgressRef.current) return;
+    const seekRevision = ++previewSeekRevisionRef.current;
+    const project = sequenceProjectRef.current;
+    const context = previewContextRef.current;
+    const sequenceId = offline ? previewSequenceId : context.sequenceId;
+    const renderSequenceId = !offline && context.finalComposition && context.rootTime != null ? project.rootSequenceId : sequenceId;
+    const renderTime = !offline && context.finalComposition && context.rootTime != null ? context.rootTime : t;
+    const runtime = sceneRuntimeRef.current;
+    if (!runtime) return;
+    if (!offline && libraryPreviewRef.current) { runtime.setVisible(false); return; }
+    runtime.setProject(project);
+    setModelVisibility(false);
+    renderSubtitleClip(null);
+    try {
+      let cache = sceneAudioCacheRef.current.get(project);
+      if (!cache) { cache = new Map(); sceneAudioCacheRef.current.set(project, cache); }
+      let audio = cache.get(renderSequenceId);
+      if (!audio) {
+        audio = { signature: JSON.stringify({ schedule: resolveAudioSchedule(project, renderSequenceId), samples: Object.values(project.assets).filter((asset) => asset.lipSync).map((asset) => [asset.id, asset.uri, asset.lipSync]) }), sample: getSceneLipAt(project, renderSequenceId) };
+        cache.set(renderSequenceId, audio);
+      }
+      await runtime.seekSceneAt(renderSequenceId, renderTime, {
+        offline, audioVersion: audio.signature, mode: mode === "all" ? "composite" : mode,
+        lipAt: audio.sample,
+      });
+      if (!offline && seekRevision === previewSeekRevisionRef.current) syncPreviewAudioAtTime(renderTime);
+    } catch (error) {
+      if (offline) throw error;
+      setAnimationIssue(error instanceof Error ? error.message : String(error));
     }
   };
 
   useEffect(() => {
-    if (!isPlaying && rendererRef.current) {
-      applyTimelineAtTime(playheadRef.current);
-      if (appRef.current) appRef.current.renderer.render(appRef.current.stage);
-    }
-  }, [animation, audioClips]);
+    if (!isPlaying) void applyTimelineAtTime(previewContextRef.current.time);
+  }, [animation, sequenceProject, isCharacterVisible, selectedModel, previewSequenceId]);
 
   const setRendererBackgroundMode = (renderer: RendererWithBackground, transparent: boolean) => {
     if (transparent) {
@@ -1146,6 +1498,8 @@ export default function Live2DView() {
 
   const syncPlayheadUi = (nextPlayhead: number, ts: number, force: boolean = false) => {
     playheadRef.current = nextPlayhead;
+    const context = previewContextRef.current;
+    previewContextRef.current = { ...context, time: nextPlayhead, rootTime: mapSequenceTimeToRoot(nextPlayhead, context.sequenceId, context.instancePath) };
 
     if (!force) {
       const lastUiTs = playheadUiLastTsRef.current;
@@ -1156,19 +1510,21 @@ export default function Live2DView() {
 
     playheadUiLastTsRef.current = ts;
     startTransition(() => {
-      setPlayhead(nextPlayhead);
+      setPreviewSequenceTime(nextPlayhead);
+      if (context.sequenceId === sequenceProjectRef.current.rootSequenceId) { rootPlayheadRef.current = nextPlayhead; setPlayhead(nextPlayhead); }
     });
   };
 
   const tick = (ts: number) => {
     if (startTsRef.current == null) startTsRef.current = ts;
-    const t = Math.min(timelineLength, (ts - startTsRef.current) / 1000);
+    const activeDuration = sequenceDuration(sequenceProjectRef.current.sequences[previewContextRef.current.sequenceId]);
+    const t = Math.min(activeDuration, (ts - startTsRef.current) / 1000);
     syncPlayheadUi(t, ts);
 
     applyTimelineAtTime(t);
 
-    if (t >= timelineLength) {
-      syncPlayheadUi(timelineLength, ts, true);
+    if (t >= activeDuration) {
+      syncPlayheadUi(activeDuration, ts, true);
       stopPlayback();
       return;
     }
@@ -1176,10 +1532,15 @@ export default function Live2DView() {
   };
 
   const startPlayback = () => {
-    if (isPlaying || timelineLength <= 0) return;
+    if (exportInProgressRef.current) return;
+    canvasEditCancelRef.current?.();
+    const activeDuration = sequenceDuration(sequenceProjectRef.current.sequences[previewContextRef.current.sequenceId]);
+    if (isPlaying || activeDuration <= 0) return;
+    libraryPreviewRef.current = false;
+    void audioManager.resumeAudioContext();
     if (previewRafRef.current != null) cancelAnimationFrame(previewRafRef.current);
     previewRafRef.current = null;
-    if (playheadRef.current >= timelineLength) playheadRef.current = 0;
+    if (playheadRef.current >= activeDuration) playheadRef.current = 0;
     playheadUiLastTsRef.current = null;
     isPlayingRef.current = true;
     setIsPlaying(true);
@@ -1188,6 +1549,7 @@ export default function Live2DView() {
   };
 
   const stopPlayback = () => {
+    canvasEditCancelRef.current?.();
     if (previewRafRef.current != null) cancelAnimationFrame(previewRafRef.current);
     previewRafRef.current = null;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -1197,7 +1559,8 @@ export default function Live2DView() {
     resetTimelineDisplayCache();
     isPlayingRef.current = false;
     setIsPlaying(false);
-    setPlayhead(playheadRef.current);
+    setPreviewSequenceTime(playheadRef.current);
+    if (previewContextRef.current.sequenceId === sequenceProjectRef.current.rootSequenceId) setPlayhead(playheadRef.current);
 
     // Stop audio
     audioManager.stopAllAudio();
@@ -1245,9 +1608,7 @@ export default function Live2DView() {
   };
 
   const exportSubtitlesSrt = async () => {
-    const entries = [...subtitleClips]
-      .filter((clip) => clip.subtitleText.trim())
-      .sort((left, right) => left.start - right.start);
+    const entries = resolveTextSchedule(sequenceProjectRef.current, previewSequenceId);
 
     if (entries.length === 0) {
       showAlert("当前没有可导出的字幕");
@@ -1264,7 +1625,7 @@ export default function Live2DView() {
       .map((clip, index) => [
         String(index + 1),
         `${formatSrtTimestamp(clip.start)} --> ${formatSrtTimestamp(clip.start + clip.duration)}`,
-        clip.subtitleText.trim(),
+        clip.speakerName ? `${clip.speakerName}：${clip.text.trim()}` : clip.text.trim(),
         "",
       ].join("\n"))
       .join("\n");
@@ -1278,33 +1639,17 @@ export default function Live2DView() {
     includeAudio: boolean,
   ) => {
     if (!canvasRef.current || !appRef.current) return;
-    if (exportState === "exporting") return;
+    if (exportState === "exporting" || exportInProgressRef.current) return;
 
-    if (mode === "subtitle-only" && subtitleClips.length === 0) {
-      showAlert("当前没有可导出的字幕轨内容");
-      return;
-    }
-
-    const totalDuration = Math.max(
-      timelineLength,
-      motionClips.reduce((t, c) => Math.max(t, c.start + c.duration), 0),
-      exprClips.reduce((t, c) => Math.max(t, c.start + c.duration), 0),
-      audioClips.reduce((t, c) => Math.max(t, c.start + c.duration), 0),
-      subtitleClips.reduce((t, c) => Math.max(t, c.start + c.duration), 0),
-      0
-    );
+    const exportSequence = sequenceProjectRef.current.sequences[previewSequenceId];
+    const totalDuration = sequenceDuration(exportSequence);
 
     if (totalDuration <= 0) {
       showAlert("时间线为空，无法导出");
       return;
     }
 
-    const qualitySettings = {
-      low: { fps: 24 },
-      medium: { fps: 30 },
-      high: { fps: 60 }
-    };
-    const settings = qualitySettings[recordingQuality];
+    const settings = { fps: exportSequence.fps };
     const targetFrames = Math.max(1, Math.ceil(totalDuration * settings.fps));
 
     const blobOnlyAudio = includeAudio
@@ -1343,13 +1688,14 @@ export default function Live2DView() {
       exportCtx = exportCanvas.getContext('2d');
     }
 
-    const exportAnimation = structuredClone(animationRef.current);
+    exportInProgressRef.current = true;
     setExportState('exporting');
     setExportTime(0);
     setExportProgress(0);
     stopPlayback();
 
     const app = appRef.current;
+    const previewSize = { width: app.screen.width, height: app.screen.height };
     const wasTickerStarted = app.ticker.started;
     app.ticker.stop();
     let prepInterval: number | null = null;
@@ -1370,7 +1716,7 @@ export default function Live2DView() {
       setModelVisibility(true);
       subtitleVisibilityOverrideRef.current = null;
     }
-    renderSubtitleClip(findActiveClip(subtitleClips, playheadRef.current) as SubtitleClip | null);
+    renderSubtitleClip(null);
 
     const updateExportUi = (timeSec: number, progressPct: number, force: boolean = false) => {
       const now = performance.now();
@@ -1391,13 +1737,17 @@ export default function Live2DView() {
         const pct = Math.min(0.05, elapsed * 0.2);
         updateExportUi(elapsed, pct * 100);
       }, 100);
+      await sceneRuntimeRef.current?.prepareSequence(previewSequenceId, true);
+      await prepareSequenceAudio(previewSequenceId, true);
+      app.renderer.resize(exportSequence.width, exportSequence.height);
+      const exportAudioSchedule = resolveAudioSchedule(sequenceProjectRef.current, previewSequenceId);
       await runVideoExport({
         canvas: exportCanvas,
         outputPath,
         format,
         fps: settings.fps,
         targetFrameCount: targetFrames,
-        applyTimelineAtTime: (timeSec) => applyTimelineAtTime(timeSec, true, exportAnimation),
+        applyTimelineAtTime: (timeSec) => applyTimelineAtTime(timeSec, true, mode),
         renderFrame: () => {
           app.renderer.render(app.stage);
           if (exportCtx) {
@@ -1417,14 +1767,17 @@ export default function Live2DView() {
             );
           }
         },
-        audioTracks: audioClips.map(c => ({
-          id: c.id,
-          start: c.start,
-          duration: c.duration,
-          sourceDuration: c.audioSourceDuration,
-          audioUrl: c.audioUrl,
-          audioPath: c.audioPath
-        })),
+        audioTracks: exportAudioSchedule.map((clip) => {
+          const asset = sequenceProjectRef.current.assets[clip.assetId];
+          const audioUrl = audioManager.audioRefs.current.get(clip.id)?.src;
+          return {
+            id: clip.id, start: clip.start, duration: clip.duration, sourceDuration: asset?.duration,
+            sourceIn: clip.sourceIn, playbackRate: clip.rate, gain: clip.gain,
+            fadeIn: clip.fadeIn, fadeOut: clip.fadeOut, muted: clip.muted,
+            gainEnvelopes: clip.gainEnvelopes,
+            audioUrl, audioPath: asset?.uri,
+          };
+        }),
         includeAudio,
         onProgress: ({ frameIndex, totalFrames, timeSec }) => {
           if (!firstFrame) {
@@ -1449,11 +1802,13 @@ export default function Live2DView() {
       setExportTime(0);
       setExportProgress(0);
     } finally {
+      exportInProgressRef.current = false;
       restoreModelVisibility(previousModelVisibility);
       subtitleVisibilityOverrideRef.current = previousSubtitleOverride;
-      renderSubtitleClip(findActiveClip(subtitleClips, playheadRef.current) as SubtitleClip | null);
+      renderSubtitleClip(null);
       if (prepInterval) { clearInterval(prepInterval); prepInterval = null; }
-      applyTimelineAtTime(playheadRef.current, true);
+      app.renderer.resize(containerRef.current?.clientWidth || previewSize.width, containerRef.current?.clientHeight || previewSize.height);
+      await applyTimelineAtTime(playheadRef.current);
       app.renderer.render(app.stage);
       if (wasTickerStarted) app.ticker.start();
     }
@@ -1654,7 +2009,6 @@ export default function Live2DView() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const arr = (await res.json()) as string[];
       setModelList(arr);
-      setSelectedModel(prev => prev ?? (externalModelPathRef.current ? null : arr[0] ?? null));
     } catch (e) {
       console.warn("读取模型库索引失败", e);
       setModelList([]);
@@ -1665,14 +2019,6 @@ export default function Live2DView() {
   useEffect(() => {
     loadModelList();
   }, [assetBase]);
-
-  useEffect(() => {
-    if (!projectHydrated || modelList.length === 0 || externalModelPathRef.current) return;
-
-    if (!selectedModel) {
-      setSelectedModel(modelList[0]);
-    }
-  }, [projectHydrated, modelList, selectedModel]);
 
   // ??????
   const refreshModels = async () => {
@@ -1705,6 +2051,15 @@ export default function Live2DView() {
       await saveModelPackages(nextPackages);
       setModelPackages(nextPackages);
       setModelList(nextModelList);
+      const project = sequenceProjectRef.current;
+      const assets = { ...project.assets };
+      for (const path of importedPaths) {
+        const id = `asset:model:${path}`;
+        assets[id] = { id, kind: "live2d", name: imported.name, uri: path };
+      }
+      changeSequenceProject({ ...project, assets });
+      libraryPreviewRef.current = true;
+      setSelectedProjectAssetId(undefined);
       setSelectedModel(importedPaths[0]);
     } catch (error) {
       console.error("导入模型失败", error);
@@ -1726,15 +2081,24 @@ export default function Live2DView() {
       const nextModelList = await invoke<string[]>("refresh_model_index");
       setModelList(nextModelList);
       if (selectedModel && target.modelPaths.includes(selectedModel)) {
-        setSelectedModel(nextModelList[0] ?? null);
+        setSelectedModel(null);
+      }
+      const project = sequenceProjectRef.current;
+      const affected = Object.values(project.assets).filter((asset) => asset.kind === "live2d" && (target.modelPaths.includes(asset.uri) || asset.uri.startsWith(`${id}/`) || asset.uri.replace(/\\/g, "/").includes(`/${id}/`)));
+      if (affected.length) {
+        const assets = { ...project.assets };
+        for (const asset of affected) assets[asset.id] = { ...asset, missing: true };
+        changeSequenceProject({ ...project, assets });
+        setAnimationIssue("模型素材已移除，片段和动画已保留。请在素材库替换缺失素材。");
       }
     } catch (error) {
       showAlert(`移除模型失败：${error instanceof Error ? error.message : String(error)}`);
     }
   };
 
-  const makeProjectSnapshot = (): ProjectSnapshot => ({
-    version: migrationFailedRef.current || pendingMigrationRef.current ? 1 : 2,
+  const makeProjectSnapshot = (): ProjectSnapshot => {
+    const currentDocument = structuredClone(sequenceProjectRef.current);
+    const base = {
     animation: animationRef.current,
     savedAt: new Date().toISOString(),
     selectedModel,
@@ -1747,7 +2111,7 @@ export default function Live2DView() {
     showSubtitles,
     showSubtitleSpeaker,
     subtitleSpeakerAlign,
-    playhead: playheadRef.current,
+    playhead: rootPlayheadRef.current,
     motionDur,
     exprDur,
     characterVisible: isCharacterVisible,
@@ -1756,9 +2120,16 @@ export default function Live2DView() {
     recordingQuality,
     transparentBg,
     customRecordingBounds,
-  });
+    };
+    return {
+      ...base,
+      version: 3,
+      document: currentDocument,
+    };
+  };
 
   const applyProjectSnapshot = async (snapshot: ProjectSnapshot) => {
+    canvasEditCancelRef.current?.();
     audioManager.initAudioContext();
     const restoredAudio = await Promise.all(snapshot.audioClips.map(async (clip) => {
       let audioUrl: string | undefined;
@@ -1774,7 +2145,39 @@ export default function Live2DView() {
     }));
     restoringProjectRef.current = snapshot;
     externalModelPathRef.current = snapshot.externalModelPath ?? null;
-    pendingMigrationRef.current = snapshot.version === 1 ? { motions: snapshot.motionClips, expressions: snapshot.exprClips } : null;
+    const restoredDocument = snapshot.document ?? migrateLegacyProject({
+      selectedModel: snapshot.selectedModel,
+      externalModelPath: snapshot.externalModelPath,
+      selectedCharacterId: snapshot.selectedCharacterId,
+      characterVisible: snapshot.characterVisible,
+      characterTransform: snapshot.characterTransform,
+      characterTransformMode: snapshot.characterTransformMode,
+      animation: snapshot.animation,
+      motionClips: snapshot.motionClips,
+      exprClips: snapshot.exprClips,
+      audioClips: restoredAudio,
+      subtitleClips: snapshot.subtitleClips,
+      showSubtitles: snapshot.showSubtitles,
+      showSubtitleSpeaker: snapshot.showSubtitleSpeaker,
+      subtitleSpeakerAlign: snapshot.subtitleSpeakerAlign,
+      playhead: snapshot.playhead,
+      savedAt: snapshot.savedAt,
+      width: Math.max(16, Math.round(snapshot.customRecordingBounds.width)),
+      height: Math.max(16, Math.round(snapshot.customRecordingBounds.height)),
+      fps: snapshot.recordingQuality === "low" ? 24 : snapshot.recordingQuality === "high" ? 60 : 30,
+    });
+    sequenceHistoryRef.current?.reset(restoredDocument);
+    projectGestureRef.current = null;
+    setNavigationResetKey((key) => key + 1);
+    sequenceProjectRef.current = restoredDocument;
+    previewContextRef.current = { sequenceId: restoredDocument.rootSequenceId, time: snapshot.playhead };
+    setPreviewSequenceId(restoredDocument.rootSequenceId);
+    setPreviewFinalComposition(false);
+    setSequenceSelection({ sequenceId: restoredDocument.rootSequenceId, clipIds: [] });
+    sceneRuntimeRef.current?.setProject(restoredDocument);
+    setSequenceProject(restoredDocument);
+    const legacyAsset = restoredDocument.assets["asset:model:main"];
+    pendingMigrationRef.current = snapshot.version === 1 ? { motions: snapshot.motionClips, expressions: snapshot.exprClips } : legacyAsset?.metadata?.legacyMotions ? { motions: JSON.parse(String(legacyAsset.metadata.legacyMotions)), expressions: JSON.parse(String(legacyAsset.metadata.legacyExpressions ?? "[]")) } : null;
     migrationFailedRef.current = false;
     changeAnimation(snapshot.animation ?? emptyAnimation());
     rendererRef.current?.invalidate();
@@ -1844,6 +2247,7 @@ export default function Live2DView() {
     exprClips,
     audioClips,
     subtitleClips,
+    sequenceProject,
     showSubtitles,
     showSubtitleSpeaker,
     subtitleSpeakerAlign,
@@ -1866,11 +2270,26 @@ export default function Live2DView() {
         filters: [{ name: "Live2D 工程", extensions: ["l2dproject"] }],
       });
       if (!path) return;
-      await writeFile(path, await createProjectBundle(makeProjectSnapshot()));
-      showAlert("工程已保存。工程包包含时间线和音频，模型仍引用本机模型库中的资源。");
+      await writeFile(path, await createProjectBundle(makeProjectSnapshot(), modelRoot ?? undefined));
+      showAlert("工程已保存，包含模型、音频和图片素材。");
     } catch (error) {
       showAlert(`保存工程失败：${error instanceof Error ? error.message : String(error)}`);
     }
+  };
+
+  const newWorkspaceProject = () => {
+    canvasEditCancelRef.current?.();
+    stopPlayback();
+    endProjectEdit();
+    const project = migrateLegacyProject({ selectedModel: null, motionClips: [], exprClips: [], audioClips: [], subtitleClips: [], playhead: 0 });
+    project.id = crypto.randomUUID(); project.name = "新工程";
+    changeSequenceProject(project);
+    setNavigationResetKey((key) => key + 1);
+    pendingMigrationRef.current = null;
+    setAnimationIssue(null);
+    setSequenceSelection({ sequenceId: project.rootSequenceId, clipIds: [] });
+    setSelectedProjectAssetId(undefined);
+    setPlayheadSec(0);
   };
 
   const openWorkspaceProject = async () => {
@@ -1881,7 +2300,8 @@ export default function Live2DView() {
         filters: [{ name: "Live2D 工程", extensions: ["l2dproject"] }],
       });
       if (typeof path !== "string") return;
-      const snapshot = await openProjectBundle(path);
+      const snapshot = await openProjectBundle(path, modelRoot ?? undefined);
+      if (modelRoot && snapshot.document) await refreshModels();
       await applyProjectSnapshot(snapshot);
       await saveAutosaveProject(snapshot);
       setLastAutosaveAt(new Date());
@@ -1917,6 +2337,33 @@ export default function Live2DView() {
       canvasRef.current = app.view as HTMLCanvasElement;
       appRef.current = app;
       app.stage.sortableChildren = true;
+      sceneRuntimeRef.current = new SceneRuntime(app, sequenceProjectRef.current, {
+        resolveAssetUrl: async (asset) => {
+          if (/^(?:https?:|data:|blob:)/.test(asset.uri)) return asset.uri;
+          if (/^(?:\/|[A-Za-z]:[\\/])/.test(asset.uri)) return buildExternalAssetUrl(await dirname(asset.uri), asset.uri);
+          const base = assetBaseRef.current ?? (await invoke<{ base_url: string }>("get_model_server_info")).base_url;
+          return `${base}/${asset.uri.split("/").map(encodeURIComponent).join("/")}`;
+        },
+        onParametersReady: (sequenceId, document, source) => {
+          const current = sequenceProjectRef.current;
+          const sequence = current.sequences[sequenceId];
+          if (sequence?.kind !== "live2d" || sequence.animation !== source) return;
+          const next = { ...current, sequences: { ...current.sequences, [sequenceId]: { ...sequence, animation: document } } };
+          sequenceProjectRef.current = next;
+          sequenceHistoryRef.current?.replaceCurrent(next);
+          setSequenceProject(next);
+        },
+        onError: (message) => setAnimationIssue(message),
+        onThumbnailReady: (assetId, thumbnail) => {
+          const current = sequenceProjectRef.current;
+          const asset = current.assets[assetId];
+          if (!asset || asset.metadata?.thumbnail) return;
+          const next = { ...current, assets: { ...current.assets, [assetId]: { ...asset, metadata: { ...asset.metadata, thumbnail } } } };
+          sequenceProjectRef.current = next;
+          sequenceHistoryRef.current?.replaceCurrent(next);
+          setSequenceProject(next);
+        },
+      });
 
       const subtitleContainer = new PIXI.Container();
       subtitleContainer.visible = false;
@@ -1974,6 +2421,7 @@ export default function Live2DView() {
       }
 
       resizeObserver = new ResizeObserver((entries) => {
+        if (exportInProgressRef.current) return;
         const entry = entries[0];
         if (!entry || !appRef.current) return;
         const width = Math.max(1, Math.round(entry.contentRect.width));
@@ -1986,6 +2434,7 @@ export default function Live2DView() {
           requestAnimationFrame(() => refreshCharacterEditor());
         }
         syncSubtitleDisplayLayout();
+        sceneRuntimeRef.current?.refreshPreview();
         syncRecordingBoundsFromCurrentModel();
       });
       resizeObserver.observe(host);
@@ -2009,6 +2458,8 @@ export default function Live2DView() {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       if (previewRafRef.current != null) cancelAnimationFrame(previewRafRef.current);
       rendererRef.current = null;
+      sceneRuntimeRef.current?.destroy();
+      sceneRuntimeRef.current = null;
       resizeObserver?.disconnect();
       canvasRef.current = null;
       if (appRef.current) {
@@ -2021,6 +2472,7 @@ export default function Live2DView() {
       subtitleSpeakerTextRef.current = null;
       subtitleSpeakerUnderlineRef.current = null;
       subtitleTextRef.current = null;
+
       modelRef.current = null;
       groupContainerRef.current = null;
     };
@@ -2033,11 +2485,6 @@ export default function Live2DView() {
       setRendererBackgroundMode(appRef.current.renderer as RendererWithBackground, transparentBg);
     }
   }, [transparentBg]);
-
-  useEffect(() => {
-    if (isPlaying) return;
-    renderSubtitleClip(findActiveClip(subtitleClips, playhead) as SubtitleClip | null);
-  }, [subtitleClips, playhead, isPlaying, showSubtitles, showSubtitleSpeaker, subtitleSpeakerAlign]);
 
   // ??????????
   useEffect(() => {
@@ -2071,6 +2518,7 @@ export default function Live2DView() {
 
   useEffect(() => {
     const handleWheelTransform = (event: WheelEvent) => {
+      if (!libraryPreviewRef.current) return;
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement || event.target instanceof HTMLSelectElement) return;
       const canvas = canvasRef.current;
       const app = appRef.current;
@@ -2101,6 +2549,102 @@ export default function Live2DView() {
     return () => canvas.removeEventListener("wheel", handleWheelTransform, wheelListenerOptions);
   }, [modelUrl, selectedCharacterId]);
 
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let wheelTimer: number | undefined;
+    let cancelDrag: (() => void) | undefined;
+    const finishCanvasEdit = () => {
+      cancelDrag?.();
+      if (wheelTimer !== undefined) { clearTimeout(wheelTimer); wheelTimer = undefined; endProjectEdit(); }
+      if (canvasEditCancelRef.current === finishCanvasEdit) canvasEditCancelRef.current = null;
+    };
+    const commitFocusedInput = () => {
+      const element = document.activeElement;
+      if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement || element instanceof HTMLSelectElement) element.blur();
+    };
+    const point = (event: MouseEvent | WheelEvent) => {
+      const rect = canvas.getBoundingClientRect(), app = appRef.current;
+      return { x: (event.clientX - rect.left) / Math.max(1, rect.width) * (app?.screen.width ?? rect.width), y: (event.clientY - rect.top) / Math.max(1, rect.height) * (app?.screen.height ?? rect.height) };
+    };
+    const selectedTransform = () => {
+      const selected = sequenceSelectionRef.current, project = sequenceProjectRef.current;
+      const sequence = project.sequences[selected.sequenceId];
+      if (!sequence) return null;
+      if (selected.actorId && sequence.kind === "live2d") return sequence.actors.find((actor) => actor.id === selected.actorId)?.transform ?? null;
+      const item = sequence.tracks.flatMap((track) => track.clips.map((clip) => ({ track, clip }))).find(({ clip }) => selected.clipIds.includes(clip.id));
+      if (!item || item.track.locked || item.clip.kind === "audio") return null;
+      return evaluateClipTransform(item.clip, item.clip.sourceIn + (previewContextRef.current.time - item.clip.start) * item.clip.rate);
+    };
+    const patchTransform = (value: Partial<import("../sequence/types").Transform>) => {
+      const selected = sequenceSelectionRef.current, project = sequenceProjectRef.current;
+      const sequence = project.sequences[selected.sequenceId];
+      if (!sequence) return;
+      if (selected.actorId && sequence.kind === "live2d") {
+        changeSequenceProject({ ...project, sequences: { ...project.sequences, [sequence.id]: { ...sequence, actors: sequence.actors.map((actor) => actor.id === selected.actorId ? { ...actor, transform: { ...actor.transform, ...value } } : actor) } } });
+        return;
+      }
+      const item = sequence.tracks.flatMap((track) => track.clips.map((clip) => ({ track, clip }))).find(({ clip }) => selected.clipIds.includes(clip.id));
+      if (!item || item.track.locked) return;
+      const sourceTime = Math.max(0, item.clip.sourceIn + (previewContextRef.current.time - item.clip.start) * item.clip.rate);
+      const current = evaluateClipTransform(item.clip, sourceTime);
+      const existing = item.clip.transformKeys.find((key) => Math.abs(key.time - sourceTime) < 1e-6);
+      const patch = item.clip.transformKeys.length ? { transformKeys: existing ? item.clip.transformKeys.map((key) => key.id === existing.id ? { ...key, ...value } : key) : [...item.clip.transformKeys, { ...current, ...value, id: crypto.randomUUID(), time: sourceTime }].sort((a, b) => a.time - b.time) } : { transform: { ...item.clip.transform, ...value } };
+      changeSequenceProject(updateClip(project, sequence.id, item.track.id, item.clip.id, patch, sequence.fps));
+    };
+    const wheel = (event: WheelEvent) => {
+      if (libraryPreviewRef.current || !enableDragging || exportState === "exporting") return;
+      const p = point(event), hit = sceneRuntimeRef.current?.hitTest(p.x, p.y), selected = sequenceSelectionRef.current;
+      if (!hit || hit.sequenceId !== selected.sequenceId || (hit.clipId ? !selected.clipIds.includes(hit.clipId) : hit.actorId !== selected.actorId)) return;
+      const transform = selectedTransform();
+      if (!transform) return;
+      event.preventDefault(); event.stopPropagation();
+      if (cancelDrag) finishCanvasEdit();
+      if (wheelTimer !== undefined) clearTimeout(wheelTimer);
+      commitFocusedInput();
+      beginProjectEdit();
+      canvasEditCancelRef.current = finishCanvasEdit;
+      const delta = event.deltaY * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? canvas.clientHeight : 1);
+      const scale = Math.exp(-Math.max(-240, Math.min(240, delta)) * 0.001);
+      patchTransform({ scaleX: Math.max(0.01, transform.scaleX * scale), scaleY: Math.max(0.01, transform.scaleY * scale) });
+      wheelTimer = window.setTimeout(() => { wheelTimer = undefined; endProjectEdit(); if (canvasEditCancelRef.current === finishCanvasEdit) canvasEditCancelRef.current = null; }, 250);
+    };
+    const down = (event: MouseEvent) => {
+      if (event.button !== 0 || libraryPreviewRef.current || !enableDragging || exportState === "exporting") return;
+      const p = point(event), runtime = sceneRuntimeRef.current, hit = runtime?.hitTest(p.x, p.y);
+      if (!hit || hit.sequenceId !== previewContextRef.current.sequenceId) return;
+      finishCanvasEdit();
+      commitFocusedInput();
+      event.preventDefault(); event.stopPropagation(); stopPlayback();
+      const selected = { sequenceId: hit.sequenceId, clipIds: hit.clipId ? [hit.clipId] : [], actorId: hit.actorId };
+      sequenceSelectionRef.current = selected; setSequenceSelection(selected);
+      const initial = selectedTransform(), origin = runtime?.pointInSequence(p.x, p.y);
+      if (!initial || !origin) return;
+      beginProjectEdit(); setIsDragging(true);
+      canvasEditCancelRef.current = finishCanvasEdit;
+      const move = (pointer: MouseEvent) => {
+        const pos = point(pointer), local = runtime?.pointInSequence(pos.x, pos.y);
+        if (!local) return;
+        patchTransform({ x: initial.x + local.x - origin.x, y: initial.y + local.y - origin.y });
+      };
+      const up = (pointer: MouseEvent) => {
+        move(pointer); finishCanvasEdit();
+      };
+      cancelDrag = () => {
+        window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up);
+        cancelDrag = undefined;
+        endProjectEdit(); setIsDragging(false);
+      };
+      window.addEventListener("mousemove", move); window.addEventListener("mouseup", up);
+    };
+    canvas.addEventListener("wheel", wheel, { passive: false, capture: true });
+    canvas.addEventListener("mousedown", down, true);
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") finishCanvasEdit(); };
+    window.addEventListener("blur", finishCanvasEdit);
+    window.addEventListener("keydown", escape);
+    return () => { canvas.removeEventListener("wheel", wheel, true); canvas.removeEventListener("mousedown", down, true); window.removeEventListener("blur", finishCanvasEdit); window.removeEventListener("keydown", escape); finishCanvasEdit(); };
+  }, [projectHydrated, modelUrl, enableDragging, exportState]);
+
   // ?????????????????
   useEffect(() => {
     (async () => {
@@ -2117,8 +2661,6 @@ export default function Live2DView() {
       // ??????????
       stopPlayback();
       const restoredProject = restoringProjectRef.current;
-      if (!restoredProject && !animationIssue) { clearTimeline(); changeAnimation(emptyAnimation()); resetHistory(); }
-
       // ????????
         modelManager.cleanupCurrentModel();
 
@@ -2177,6 +2719,9 @@ export default function Live2DView() {
     modelList,
     selectedModel,
     onSelectModel: (rel: string | null) => {
+      libraryPreviewRef.current = true;
+      setSelectedProjectAssetId(undefined);
+      sceneRuntimeRef.current?.setVisible(false);
       setExternalModelDisplayName(null);
       externalModelPathRef.current = null;
       setExternalModelUrl(null);
@@ -2189,6 +2734,14 @@ export default function Live2DView() {
     onImportModel: () => void importModel(false),
     onImportModelFolder: () => void importModel(true),
     onDeleteModelPackage: (id: string) => void deleteModelPackage(id),
+    projectAssets: Object.values(sequenceProject.assets).filter((asset) => (asset.kind !== "live2d" || asset.missing) && ((asset.kind !== "motion" && asset.kind !== "expression") || asset.metadata?.sourceModel !== materialModelOrigin())),
+    getMaterialSource,
+    selectedProjectAssetId,
+    projectAssetThumbnails,
+    onSelectProjectAsset: (asset: ProjectAsset) => void previewProjectAsset(asset),
+    onRepairAsset: (assetId: string) => void repairProjectAsset(assetId),
+    onImportProjectAudio: () => void importProjectAudioAsset(),
+    onImportProjectImage: () => void importProjectImageAsset(),
     onSaveProject: () => void saveWorkspaceProject(),
     onOpenProject: () => void openWorkspaceProject(),
     autosaveStatus: !projectHydrated
@@ -2214,7 +2767,6 @@ export default function Live2DView() {
     },
     addMotionClip,
     addExprClip,
-    addAudioClip,
     subtitleClips,
     showSubtitles,
     setShowSubtitles,
@@ -2237,6 +2789,7 @@ export default function Live2DView() {
     setEnableDragging,
     isDragging,
     timelineLength,
+    projectFps: sequenceProject.sequences[previewSequenceId]?.fps ?? sequenceProject.fps,
     playhead,
     isPlaying,
     startPlayback,
@@ -2276,9 +2829,9 @@ export default function Live2DView() {
               id="topbar-model-select"
               className="input input--topbar"
               value={selectedModel ?? ""}
-              onChange={(event) => setSelectedModel(event.target.value || null)}
+              onChange={(event) => panelProps.onSelectModel(event.target.value || null)}
             >
-              {modelList.length === 0 ? <option value="">未发现模型</option> : null}
+              <option value="">{modelList.length === 0 ? "未发现模型" : "选择模型"}</option>
               {selectedModel && !modelList.includes(selectedModel) && <option value={selectedModel}>{selectedModel.split('/').pop()}</option>}
               {modelList.map((rel) => (
                 <option key={rel} value={rel}>
@@ -2289,6 +2842,9 @@ export default function Live2DView() {
           </div>
 
           <div className="topbar-button-group">
+            <button className="btn btn--quiet" onClick={newWorkspaceProject}>新建</button>
+            <button className="btn btn--quiet" onClick={() => void openWorkspaceProject()}>打开</button>
+            <button className="btn btn--quiet" onClick={() => void saveWorkspaceProject()}>保存</button>
             <button className="btn btn--quiet" onClick={refreshModels}>
               刷新
             </button>
@@ -2298,8 +2854,8 @@ export default function Live2DView() {
             <button className={`btn ${isPlaying ? "btn--accent" : "btn--primary"}`} onClick={isPlaying ? stopPlayback : startPlayback} disabled={!timelineLength && !isPlaying}>
               {isPlaying ? "停止播放" : "开始播放"}
             </button>
-            <button className="btn btn--quiet" onClick={addAudioClip}>
-              导入音频
+            <button className="btn btn--quiet" onClick={importProjectAudioAsset}>
+              导入音频素材
             </button>
             {/* WebGAL 入口暂时停用
             <button className="btn btn--quiet" onClick={() => setShowWebGALMode(true)}>
@@ -2344,11 +2900,10 @@ export default function Live2DView() {
                 data-transparent={transparentBg}
               />
 
-              {!selectedModel ? (
+              {!selectedModel && !timelineLength && !selectedProjectAssetId ? (
                 <div className="monitor-empty">
                   <span className="monitor-empty-mark" aria-hidden="true">✦</span>
-                  <strong>准备好你的第一个角色</strong>
-                  <span>导入模型文件夹、ZIP 压缩包或模型配置文件，即可开始编排。</span>
+                  <strong>拖入素材开始剪辑</strong>
                   <div className="monitor-empty-actions">
                     <button className="btn btn--accent" onClick={() => void importModel(false)} disabled={isImportingModel}>
                       选择模型文件 / ZIP
@@ -2361,12 +2916,13 @@ export default function Live2DView() {
               ) : null}
 
               <div className="monitor-overlay monitor-overlay--top">
-                <span>预览器</span>
+                <span>{selectedProjectAssetId && libraryPreviewRef.current ? sequenceProject.assets[selectedProjectAssetId]?.name : sequenceProject.sequences[previewSequenceId]?.name}</span>
               </div>
+              {libraryPreviewRef.current && selectedProjectAssetId && sequenceProject.assets[selectedProjectAssetId]?.kind === "audio" && projectAssetThumbnails[selectedProjectAssetId] && <audio key={selectedProjectAssetId} controls src={projectAssetThumbnails[selectedProjectAssetId]} style={{ position: "absolute", left: "10%", top: "45%", width: "80%" }} />}
 
               <div className="monitor-overlay monitor-overlay--bottom">
                 <span>FPS {currentFps.toFixed(1)}</span>
-                <span>播放头 {playhead.toFixed(2)} 秒</span>
+                <span>{previewSequenceTime.toFixed(2)} 秒</span>
                 <span>{enableDragging ? "允许拖拽" : "拖拽关闭"}</span>
               </div>
             </div>
@@ -2387,12 +2943,15 @@ export default function Live2DView() {
         />
 
         <aside className="workspace-dock workspace-dock--right">
-          <ControlPanel
-            {...panelProps}
-            mode="inspector"
-            activeInspectorTab={activeInspectorTab}
-            onChangeInspectorTab={setActiveInspectorTab}
-          />
+          <div className="inspector-tabs" role="tablist" aria-label="检查器分页" inert={exportState === "exporting"}>
+            {([['character', '检查器'], ['export', '导出'], ['project', '工程']] as const).map(([tab, label]) => <button key={tab} role="tab" aria-selected={activeInspectorTab === tab} className={`inspector-tab${activeInspectorTab === tab ? ' is-active' : ''}`} onClick={() => setActiveInspectorTab(tab)}>{label}</button>)}
+          </div>
+          {activeInspectorTab === "character" ? <SequenceInspector project={sequenceProject} onProjectChange={changeSequenceProject}
+            selection={sequenceSelection} time={previewSequenceTime}
+            onBeginEdit={() => { stopPlayback(); beginProjectEdit(); }} onEndEdit={endProjectEdit} /> : <>
+              {activeInspectorTab === "export" && <div className="pane-note">{sequenceProject.sequences[previewSequenceId]?.name} · {sequenceProject.sequences[previewSequenceId]?.width}×{sequenceProject.sequences[previewSequenceId]?.height} · {sequenceProject.sequences[previewSequenceId]?.fps} fps</div>}
+              <ControlPanel {...panelProps} mode="inspector" activeInspectorTab={activeInspectorTab} hideInspectorTabs inspectorTabs={["export", "project"]} />
+            </>}
         </aside>
       </div>
 
@@ -2414,19 +2973,35 @@ export default function Live2DView() {
           else if (appRef.current && modelUrl) void modelManager.loadAnyModel(appRef.current, modelUrl).catch(error => setAnimationIssue(`模型加载失败：${String(error)}`));
         }}>重试加载</button><button className="btn btn--quiet" onClick={() => void importModel(false)}>补充模型</button></div>}
         <Timeline
-          onImportMaterial={(name, kind, start) => void addMaterial(name, kind, start)}
+          project={sequenceProject}
+          navigationResetKey={navigationResetKey}
+          onProjectChange={changeSequenceProject}
+          onUndoProject={undoSequenceProject}
+          onRedoProject={redoSequenceProject}
+          onBeginProjectEdit={() => { stopPlayback(); beginProjectEdit(); }}
+          onEndProjectEdit={endProjectEdit}
+          onSelectionChange={(sequenceId, clipIds) => { setSequenceSelection({ sequenceId, clipIds }); if (clipIds.length) { libraryPreviewRef.current = false; void applyTimelineAtTime(previewContextRef.current.time); } }}
+          externalSelection={sequenceSelection}
+          previewSequenceId={previewSequenceId}
+          previewSequenceTime={previewSequenceTime}
+          showInlineInspector={false}
+          assetThumbnails={projectAssetThumbnails}
+          onImportMaterial={(name, kind, start, source) => void addMaterial(name, kind, start, source)}
+          onImportIntoSequence={importMaterialIntoSequence}
+          onSequenceAnimationChange={(sequenceId, document) => {
+            const current = sequenceProjectRef.current;
+            const target = current.sequences[sequenceId];
+            if (target?.kind !== "live2d") return;
+            changeSequenceProject({ ...current, sequences: { ...current.sequences, [sequenceId]: { ...target, animation: document } } });
+          }}
           animation={animation}
           onAnimationChange={changeAnimation}
           onBeginEdit={() => { stopPlayback(); beginEdit(); }}
           onEndEdit={endEdit}
           onUndo={undo}
           onRedo={redo}
-          motionClips={motionClips}
-          exprClips={exprClips}
-          audioClips={audioClips}
-          subtitleClips={subtitleClips}
           playheadSec={playhead}
-          playheadSourceRef={playheadRef}
+          playheadSourceRef={rootPlayheadRef}
           onChangeClip={changeClip}
           onRemoveClip={(track, id) => {
             if (track === "motion") setMotionClips(prev => prev.filter(c => c.id !== id));
@@ -2444,6 +3019,8 @@ export default function Live2DView() {
             }
           }}
           onSetPlayhead={setPlayheadSec}
+          onSeekSequence={seekSequence}
+          audioSourceDuration={(clip) => clip.assetId ? sequenceProject.assets[clip.assetId]?.duration : undefined}
           onStartPlayback={startPlayback}
           onStopPlayback={stopPlayback}
           isPlaying={isPlaying}

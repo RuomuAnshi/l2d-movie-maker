@@ -2,14 +2,32 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import vm from "node:vm";
 import { createRequire } from "node:module";
 import { ModelAdapter, TimelineRenderer } from "../src/animation/runtime";
 import { importMaterial } from "../src/animation/importers";
 import { emptyAnimation } from "../src/animation/types";
-const modelPath = process.env.L2D_TEST_MODEL;
+function findManagedFixture(): string | undefined {
+  const managed = join(homedir(), "Library", "Application Support", "com.DongshanRandeng.l2dmm", "models");
+  if (!existsSync(managed)) return undefined;
+  const visit = (folder: string, depth: number): string | undefined => {
+    if (depth > 3) return undefined;
+    try {
+      const entries = readdirSync(folder, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) if (entry.isFile() && /\.model3\.json$/i.test(entry.name)) return join(folder, entry.name);
+      for (const entry of entries) if (entry.isDirectory() && !entry.name.startsWith(".")) {
+        const fixture = visit(join(folder, entry.name), depth + 1);
+        if (fixture) return fixture;
+      }
+    } catch { /* Fixture access is optional on other machines. */ }
+    return undefined;
+  };
+  return visit(managed, 0);
+}
+const modelPath = process.env.L2D_TEST_MODEL || findManagedFixture();
 test(
   "local Cubism model: native core, actual motion/expression files, physics and drawable geometry",
   { skip: !modelPath },

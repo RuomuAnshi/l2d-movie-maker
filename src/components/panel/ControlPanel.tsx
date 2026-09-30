@@ -3,6 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import ExportToolbar from "../ExportToolbar";
 import type { SubtitleClip } from "../timeline/clipTypes";
 import type { ModelPackage } from "../../utils/modelLibrary";
+import type { ProjectAsset } from "../../sequence/types";
+import { materialSourceFromAsset } from "../../sequence/materials";
+import type { MaterialSource } from "../../sequence/materials";
 import type { VideoExportFormat, VideoExportMode } from "../../utils/videoExporter";
 
 interface Motion {
@@ -42,6 +45,8 @@ type Props = {
   mode: ControlPanelMode;
   activeInspectorTab?: InspectorTab;
   onChangeInspectorTab?: (tab: InspectorTab) => void;
+  inspectorTabs?: InspectorTab[];
+  hideInspectorTabs?: boolean;
   // onToggleWebGALMode: () => void;
 
   modelList: string[];
@@ -53,6 +58,14 @@ type Props = {
   onImportModel: () => void;
   onImportModelFolder: () => void;
   onDeleteModelPackage: (id: string) => void;
+  projectAssets: ProjectAsset[];
+  onSelectProjectAsset?: (asset: ProjectAsset) => void;
+  selectedProjectAssetId?: string;
+  projectAssetThumbnails?: Record<string, string>;
+  onRepairAsset?: (assetId: string) => void;
+  getMaterialSource?: (name: string, kind: "motion" | "expression") => MaterialSource | undefined;
+  onImportProjectAudio: () => void;
+  onImportProjectImage: () => void;
   onSaveProject: () => void;
   onOpenProject: () => void;
   autosaveStatus: string;
@@ -72,7 +85,6 @@ type Props = {
   chooseExpression: (name: string) => void;
   addMotionClip: (name: string) => void;
   addExprClip: (name: string) => void;
-  addAudioClip: () => void;
   subtitleClips: SubtitleClip[];
   showSubtitles: boolean;
   setShowSubtitles: (visible: boolean) => void;
@@ -120,14 +132,16 @@ type Props = {
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
+  exportSequenceLabel?: string;
+  projectFps?: number;
 };
 
-const inspectorTabs: Array<{ id: InspectorTab; label: string }> = [
+const INSPECTOR_TABS: Array<{ id: InspectorTab; label: string }> = [
   { id: "character", label: "角色" },
   { id: "subtitle", label: "字幕" },
   { id: "export", label: "导出" },
   { id: "audio", label: "音频" },
-  { id: "project", label: "项目" },
+  { id: "project", label: "工程" },
 ];
 
 const FALLBACK_SUBTITLE_FONTS = [
@@ -198,7 +212,7 @@ function Pager({
 export default function ControlPanel(props: Props) {
   const {
     mode,
-    activeInspectorTab = "character",
+    activeInspectorTab: requestedInspectorTab = "export",
     onChangeInspectorTab,
     // onToggleWebGALMode,
     selectedModel,
@@ -208,6 +222,9 @@ export default function ControlPanel(props: Props) {
     onImportModel,
     onImportModelFolder,
     onDeleteModelPackage,
+    projectAssets,
+    onImportProjectAudio,
+    onImportProjectImage,
     onSaveProject,
     onOpenProject,
     autosaveStatus,
@@ -221,7 +238,6 @@ export default function ControlPanel(props: Props) {
     chooseExpression,
     addMotionClip,
     addExprClip,
-    addAudioClip,
     subtitleClips,
     showSubtitles,
     setShowSubtitles,
@@ -271,6 +287,11 @@ export default function ControlPanel(props: Props) {
   const [exprQuery, setExprQuery] = useState("");
   const [exprPage, setExprPage] = useState(1);
   const [exprPageSize, setExprPageSize] = useState(12);
+  const [localSelectedProjectAssetId, setLocalSelectedProjectAssetId] = useState("");
+  const selectedProjectAssetId = props.selectedProjectAssetId ?? localSelectedProjectAssetId;
+  const visibleInspectorTabs = INSPECTOR_TABS.filter((tab) => (props.inspectorTabs ?? ["export", "project"]).includes(tab.id));
+  const activeInspectorTab = visibleInspectorTabs.some((tab) => tab.id === requestedInspectorTab) ? requestedInspectorTab : visibleInspectorTabs[0]?.id ?? "export";
+  const subtitleTabEnabled = visibleInspectorTabs.some((tab) => tab.id === "subtitle");
   const [exportFormat, setExportFormat] = useState<VideoExportFormat>("webm");
   const [exportMode, setExportMode] = useState<VideoExportMode>("all");
   const [includeExportAudio, setIncludeExportAudio] = useState(true);
@@ -314,6 +335,7 @@ export default function ControlPanel(props: Props) {
   }, [exprQuery, exprPageSize, modelData]);
 
   useEffect(() => {
+    if (mode !== "inspector" || !subtitleTabEnabled) return;
     let cancelled = false;
 
     void invoke<string[]>("list_system_font_families")
@@ -331,7 +353,7 @@ export default function ControlPanel(props: Props) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [mode, subtitleTabEnabled]);
 
   const allMotionNames = useMemo(
     () => (modelData ? Object.keys(modelData.motions || {}) : []),
@@ -481,7 +503,7 @@ export default function ControlPanel(props: Props) {
     return (
       <div className="asset-list">
         {items.map((name) => (
-          <div key={name} className={`asset-item ${activeValue === name ? "is-active" : ""}`} draggable onDragStart={event => { event.dataTransfer.setData("application/x-live2d-material", JSON.stringify({ name, kind })); event.dataTransfer.effectAllowed = "copy"; }}>
+          <div key={name} className={`asset-item ${activeValue === name ? "is-active" : ""}`} draggable onDragStart={event => { event.dataTransfer.setData("application/x-live2d-material", JSON.stringify({ name, kind, source: props.getMaterialSource?.(name, kind) })); event.dataTransfer.effectAllowed = "copy"; }}>
             <div className="asset-copy">
               <strong>{name}</strong>
               <span>
@@ -502,7 +524,7 @@ export default function ControlPanel(props: Props) {
     );
   };
 
-  const paneTitle = mode === "resources" ? "资源浏览器" : "检查器";
+  const paneTitle = mode === "resources" ? "素材库" : activeInspectorTab === "export" ? "导出" : activeInspectorTab === "project" ? "工程" : "检查器";
 
   return (
     <div className={`workspace-pane workspace-pane--${mode}`}>
@@ -513,9 +535,9 @@ export default function ControlPanel(props: Props) {
         </div>
       </div>
 
-      {mode === "inspector" ? (
+      {mode === "inspector" && !props.hideInspectorTabs ? (
         <div className="inspector-tabs" role="tablist" aria-label="检查器分页" inert={exportState === "exporting"}>
-          {inspectorTabs.map((tab) => (
+          {visibleInspectorTabs.map((tab) => (
             <button
               key={tab.id}
               className={`inspector-tab ${activeInspectorTab === tab.id ? "is-active" : ""}`}
@@ -560,11 +582,16 @@ export default function ControlPanel(props: Props) {
                         <button
                           key={path}
                           className={`model-library-entry ${selectedModel === path ? "is-active" : ""}`}
+                          draggable
+                          onDragStart={(event) => {
+                            event.dataTransfer.setData("application/x-live2d-asset", JSON.stringify({ modelPath: path, name: path.split("/").slice(-1)[0] }));
+                            event.dataTransfer.effectAllowed = "copy";
+                          }}
                           onClick={() => onSelectModel(path)}
                           title={path}
                         >
                           <span>{path.split("/").slice(-1)[0]}</span>
-                          <small>{selectedModel === path ? "当前预览" : "选择模型"}</small>
+                          {selectedModel === path && <small>预览</small>}
                         </button>
                       ))}
                     </div>
@@ -573,15 +600,40 @@ export default function ControlPanel(props: Props) {
                     <button
                       key={path}
                       className={`model-library-entry model-library-entry--legacy ${selectedModel === path ? "is-active" : ""}`}
+                      draggable
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData("application/x-live2d-asset", JSON.stringify({ modelPath: path, name: path.split("/").slice(-1)[0] }));
+                        event.dataTransfer.effectAllowed = "copy";
+                      }}
                       onClick={() => onSelectModel(path)}
                       title={path}
                     >
                       <span>{path.split("/").slice(-1)[0]}</span>
-                      <small>{selectedModel === path ? "当前预览" : "旧资源"}</small>
+                      {selectedModel === path && <small>预览</small>}
                     </button>
                   ))}
                 </div>
               )}
+            </PanelSection>
+            <PanelSection title="工程素材" meta={`${projectAssets.length} 项`} className="workspace-section--library">
+              <div className="button-row">
+                <button className="btn btn--quiet" onClick={onImportProjectAudio}>导入音频</button>
+                <button className="btn btn--quiet" onClick={onImportProjectImage}>导入图片</button>
+              </div>
+              {projectAssets.length ? <div className="model-library-list">
+                {projectAssets.map((asset) => <div key={asset.id} className="project-asset-row" style={{ display: "flex", alignItems: "center", gap: 4 }}><button
+                  className={`model-library-entry${selectedProjectAssetId === asset.id ? " is-active" : ""}`}
+                  style={{ flex: 1, minWidth: 0 }}
+                  draggable
+                  onClick={() => { setLocalSelectedProjectAssetId(asset.id); props.onSelectProjectAsset?.(asset); }}
+                  onDragStart={(event) => {
+                    if (asset.kind === "motion" || asset.kind === "expression") event.dataTransfer.setData("application/x-live2d-material", JSON.stringify({ name: asset.name, kind: asset.kind, source: materialSourceFromAsset(asset) }));
+                    else event.dataTransfer.setData("application/x-live2d-asset", JSON.stringify({ assetId: asset.id }));
+                    event.dataTransfer.effectAllowed = "copy";
+                  }}
+                  title={asset.uri}
+                >{asset.kind === "image" && props.projectAssetThumbnails?.[asset.id] && <img src={props.projectAssetThumbnails[asset.id]} alt="" draggable={false} style={{ width: 30, height: 26, objectFit: "contain", imageRendering: "pixelated", flexShrink: 0 }} />}<span>{asset.name}</span><small>{asset.kind === "audio" ? "音频" : asset.kind === "image" ? "图片" : asset.kind === "text" ? "文字" : asset.kind === "sequence" ? "复合" : asset.kind === "motion" ? "动作" : asset.kind === "expression" ? "表情" : "Live2D"}{asset.missing ? " · 缺失" : ""}</small></button>{asset.missing && props.onRepairAsset && <button className="btn btn--quiet" onClick={() => props.onRepairAsset?.(asset.id)} title={`替换 ${asset.name}`} aria-label={`替换缺失素材 ${asset.name}`}>替换</button>}</div>)}
+              </div> : <div className="pane-empty"><span>导入音频或图片后，拖到时间线使用。</span></div>}
             </PanelSection>
             <PanelSection title="动作" meta={`${filteredMotions.length} 条`} className="workspace-section--library">
               <div className="toolbar-row">
@@ -885,6 +937,8 @@ export default function ControlPanel(props: Props) {
                     onExportSubtitlesSrt={onExportSubtitlesSrt}
                     onTakeScreenshot={onTakeScreenshot}
                     onTakePartsScreenshots={onTakePartsScreenshots}
+                    exportSequenceLabel={props.exportSequenceLabel}
+                    projectFps={props.projectFps}
                   />
                 </PanelSection>
                 <PanelSection title="会话状态">
@@ -920,8 +974,8 @@ export default function ControlPanel(props: Props) {
                     <button className="btn btn--quiet" onClick={clearTimeline}>
                       清空时间线
                     </button>
-                    <button className="btn btn--accent" onClick={addAudioClip}>
-                      导入音频
+                    <button className="btn btn--accent" onClick={onImportProjectAudio}>
+                      导入到素材库
                     </button>
                   </div>
                 </PanelSection>
