@@ -8,6 +8,7 @@ export type Clip = {
   audioSourceDuration?: number;
   waveformPeaks?: number[];
   audioBuffer?: AudioBuffer;
+  lipSync?: number[];
 };
 
 export type SubtitleClip = Clip & {

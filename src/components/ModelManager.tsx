@@ -80,6 +80,7 @@ interface ModelManagerProps {
   enableDragging: boolean;
   setIsDragging: (dragging: boolean) => void;
   onTransformChange?: (transform: TransformSnapshot) => void;
+  onBeforeModelDispose?: () => void;
 }
 
 export default function ModelManager({
@@ -92,7 +93,8 @@ export default function ModelManager({
   setCustomRecordingBounds,
   enableDragging,
   setIsDragging,
-  onTransformChange
+  onTransformChange,
+  onBeforeModelDispose
 }: ModelManagerProps) {
   
   // 工具函数
@@ -114,6 +116,8 @@ export default function ModelManager({
   };
 
   const cleanupCurrentModel = () => {
+    onBeforeModelDispose?.();
+    setModelData(null);
     const app = appRef.current;
     if (!app) return;
     try {
@@ -389,6 +393,7 @@ export default function ModelManager({
     } catch (err) {
       console.error("�?模型加载失败:", err);
       setModelData(null);
+      throw err;
     }
   };
 
@@ -490,6 +495,7 @@ export default function ModelManager({
       modelRef.current = null;
       isCompositeRef.current = false;
       motionBaseRef.current = null;
+      throw err;
     }
   };
 

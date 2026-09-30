@@ -11,7 +11,8 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node scripts/test-animation.mjs"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.15",

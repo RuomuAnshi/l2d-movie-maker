@@ -42,7 +42,7 @@ type Props = {
   mode: ControlPanelMode;
   activeInspectorTab?: InspectorTab;
   onChangeInspectorTab?: (tab: InspectorTab) => void;
-  onToggleWebGALMode: () => void;
+  // onToggleWebGALMode: () => void;
 
   modelList: string[];
   selectedModel: string | null;
@@ -200,7 +200,7 @@ export default function ControlPanel(props: Props) {
     mode,
     activeInspectorTab = "character",
     onChangeInspectorTab,
-    onToggleWebGALMode,
+    // onToggleWebGALMode,
     selectedModel,
     modelList,
     modelPackages,
@@ -217,10 +217,6 @@ export default function ControlPanel(props: Props) {
     motionLen,
     currentMotion,
     currentExpression,
-    motionDur,
-    exprDur,
-    setMotionDur,
-    setExprDur,
     chooseMotion,
     chooseExpression,
     addMotionClip,
@@ -485,7 +481,7 @@ export default function ControlPanel(props: Props) {
     return (
       <div className="asset-list">
         {items.map((name) => (
-          <div key={name} className={`asset-item ${activeValue === name ? "is-active" : ""}`}>
+          <div key={name} className={`asset-item ${activeValue === name ? "is-active" : ""}`} draggable onDragStart={event => { event.dataTransfer.setData("application/x-live2d-material", JSON.stringify({ name, kind })); event.dataTransfer.effectAllowed = "copy"; }}>
             <div className="asset-copy">
               <strong>{name}</strong>
               <span>
@@ -518,7 +514,7 @@ export default function ControlPanel(props: Props) {
       </div>
 
       {mode === "inspector" ? (
-        <div className="inspector-tabs" role="tablist" aria-label="检查器分页">
+        <div className="inspector-tabs" role="tablist" aria-label="检查器分页" inert={exportState === "exporting"}>
           {inspectorTabs.map((tab) => (
             <button
               key={tab.id}
@@ -533,7 +529,7 @@ export default function ControlPanel(props: Props) {
         </div>
       ) : null}
 
-      <div ref={paneScrollRef} className="workspace-pane-scroll">
+      <div ref={paneScrollRef} className="workspace-pane-scroll" inert={exportState === "exporting" && activeInspectorTab !== "export"}>
         {mode === "resources" ? (
           <>
             <PanelSection title="模型库" meta={`${modelList.length} 个模型`}>
@@ -607,20 +603,6 @@ export default function ControlPanel(props: Props) {
                     </option>
                   ))}
                 </select>
-                <div className="library-duration-inline">
-                  <label className="field-label" htmlFor="motion-duration">
-                    时长
-                  </label>
-                  <input
-                    id="motion-duration"
-                    className="input"
-                    type="number"
-                    min={0.1}
-                    step={0.1}
-                    value={motionDur}
-                    onChange={(event) => setMotionDur(Math.max(0.1, Number(event.target.value) || 0.1))}
-                  />
-                </div>
               </div>
               <Pager page={safeMotionPage} pageCount={motionPageCount} onPageChange={setMotionPage} />
               {renderResourceList(motionSlice, currentMotion, chooseMotion, addMotionClip, "motion")}
@@ -646,20 +628,6 @@ export default function ControlPanel(props: Props) {
                     </option>
                   ))}
                 </select>
-                <div className="library-duration-inline">
-                  <label className="field-label" htmlFor="expression-duration">
-                    时长
-                  </label>
-                  <input
-                    id="expression-duration"
-                    className="input"
-                    type="number"
-                    min={0.1}
-                    step={0.1}
-                    value={exprDur}
-                    onChange={(event) => setExprDur(Math.max(0.1, Number(event.target.value) || 0.1))}
-                  />
-                </div>
               </div>
               <Pager page={safeExpressionPage} pageCount={expressionPageCount} onPageChange={setExprPage} />
               {renderResourceList(expressionSlice, currentExpression, chooseExpression, addExprClip, "expression")}
@@ -1015,9 +983,11 @@ export default function ControlPanel(props: Props) {
                     <button className="btn btn--quiet" onClick={clearTimeline}>
                       清空时间线
                     </button>
+                    {/* WebGAL 入口暂时停用
                     <button className="btn btn--quiet" onClick={onToggleWebGALMode}>
                       打开 WebGAL
                     </button>
+                    */}
                   </div>
                 </PanelSection>
               </>

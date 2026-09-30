@@ -33,9 +33,9 @@ pub fn run() {
             crate::commands::server::get_model_server_info,
             crate::commands::server::register_external_asset_root,
             crate::commands::server::refresh_model_index,
-            crate::commands::webgal::webgal_path_exists,
-            crate::commands::webgal::webgal_read_text_file,
-            crate::commands::webgal::validate_webgal_project_dir,
+            // WebGAL 暂时停用：crate::commands::webgal::webgal_path_exists,
+            // WebGAL 暂时停用：crate::commands::webgal::webgal_read_text_file,
+            // WebGAL 暂时停用：crate::commands::webgal::validate_webgal_project_dir,
             crate::commands::webgal::list_system_font_families,
         ]);
 

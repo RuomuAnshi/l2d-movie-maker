@@ -1,3 +1,5 @@
+import { isAnimationDocument } from "../animation/validation";
+import type { AnimationDocument } from "../animation/types";
 import JSZip from "jszip";
 import { appDataDir, appLocalDataDir, extname, join } from "@tauri-apps/api/path";
 import { copyFile, mkdir, readFile, readTextFile, stat, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
@@ -7,7 +9,9 @@ export type StoredClip = Omit<Clip, "audioBuffer" | "audioUrl">;
 export type StoredSubtitleClip = Omit<SubtitleClip, "audioBuffer" | "audioUrl">;
 
 export type ProjectSnapshot = {
-  version: 1;
+  version: 1 | 2;
+  animation?: AnimationDocument;
+  externalModelPath?: string;
   savedAt: string;
   selectedModel: string | null;
   selectedCharacterId: string;
@@ -56,7 +60,17 @@ export async function storeAudioBytes(bytes: Uint8Array, extension: string) {
 export async function saveAutosaveProject(snapshot: ProjectSnapshot) {
   const localData = await appLocalDataDir();
   await mkdir(localData, { recursive: true });
-  await writeTextFile(await join(localData, AUTOSAVE_FILE), JSON.stringify(snapshot));
+  const path = await join(localData, AUTOSAVE_FILE);
+  if (snapshot.version === 2) {
+    let previous: string | null = null;
+    try { previous = await readTextFile(path); } catch { /* A first save has no previous file. */ }
+    if (previous) {
+      let legacy = false;
+      try { legacy = JSON.parse(previous).version === 1; } catch { /* Invalid old data is not a V1 project. */ }
+      if (legacy) await writeTextFile(await join(localData, `autosave-v1-backup-${Date.now()}.json`), previous);
+    }
+  }
+  await writeTextFile(path, JSON.stringify(snapshot));
 }
 
 export async function loadAutosaveProject(): Promise<ProjectSnapshot | null> {
@@ -110,11 +124,11 @@ export async function openProjectBundle(path: string): Promise<ProjectSnapshot> 
   const projectFile = zip.file(BUNDLE_PROJECT_FILE);
   if (!projectFile) throw new Error("工程包中缺少 project.json。");
   const projectSize = (projectFile as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
-  if (typeof projectSize === "number" && projectSize > 10 * 1024 * 1024) {
-    throw new Error("工程清单超过 10 MiB。");
+  if (typeof projectSize === "number" && projectSize > 64 * 1024 * 1024) {
+    throw new Error("工程清单超过 64 MiB。");
   }
   const content = await projectFile.async("string");
-  if (content.length > 10 * 1024 * 1024) throw new Error("工程清单超过 10 MiB。");
+  if (content.length > 64 * 1024 * 1024) throw new Error("工程清单超过 64 MiB。");
   const parsed: unknown = JSON.parse(content);
   if (!isProjectSnapshot(parsed)) throw new Error("不支持的工程格式或工程文件已损坏。");
 
@@ -148,15 +162,17 @@ export async function openProjectBundle(path: string): Promise<ProjectSnapshot> 
   return restored;
 }
 
-function stripRuntimeAudio<T extends Clip>(clip: T): Omit<T, "audioBuffer" | "audioUrl"> {
-  const { audioBuffer: _audioBuffer, audioUrl: _audioUrl, ...stored } = clip;
+export function stripRuntimeAudio<T extends Clip>(clip: T): Omit<T, "audioBuffer" | "audioUrl"> {
+  const stored = { ...clip };
+  delete stored.audioBuffer;
+  delete stored.audioUrl;
   return stored;
 }
 
 function isProjectSnapshot(value: unknown): value is ProjectSnapshot {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<ProjectSnapshot>;
-  return candidate.version === 1 &&
+  return (candidate.version === 1 || (candidate.version === 2 && isAnimationDocument(candidate.animation))) &&
     Array.isArray(candidate.motionClips) && Array.isArray(candidate.exprClips) &&
     Array.isArray(candidate.audioClips) && Array.isArray(candidate.subtitleClips) &&
     typeof candidate.selectedCharacterId === "string" &&
