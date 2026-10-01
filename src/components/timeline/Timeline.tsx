@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ParameterTimeline from "./ParameterTimeline";
-import type { Clip as LegacyClip, TrackKind } from "./clipTypes";
 import type { AnimationDocument } from "../../animation/types";
+import type { AnimationExportOptions } from "../../animation/exporters";
 import { emptyAnimation } from "../../animation/types";
 import { addTrack, changeClipRate, clipVolumeAt, createCompound, createIndependentClip, deleteClips, evaluateClipTransform, insertClip, moveClips, moveClip, pasteClips, removeEmptyTrack, reorderTrack, sequenceDuration, splitClip, trimClip, updateClip } from "../../sequence/engine";
 import { createClip, DEFAULT_TRANSFORM } from "../../sequence/types";
@@ -25,6 +25,7 @@ type Props = {
   onImportMaterial: (name: string, kind: "motion" | "expression", start: number, source?: MaterialSource) => void;
   onImportIntoSequence?: (sequenceId: string, name: string, kind: "motion" | "expression", start: number, source?: MaterialSource) => void;
   onSequenceAnimationChange?: (sequenceId: string, document: AnimationDocument) => void;
+  onExportAnimation?: (sequenceId: string, options: AnimationExportOptions) => Promise<string | undefined>;
   animation: AnimationDocument;
   onAnimationChange: (document: AnimationDocument) => void;
   onBeginEdit: () => void;
@@ -35,8 +36,6 @@ type Props = {
   previewSequenceId?: string;
   previewSequenceTime?: number;
   playheadSourceRef?: { current: number };
-  onChangeClip: (track: TrackKind, id: string, patch: Partial<Pick<LegacyClip, "start" | "duration">>) => void;
-  onRemoveClip: (track: TrackKind, id: string) => void;
   onSetPlayhead?: (time: number) => void;
   onSeekSequence?: (sequenceId: string, time: number, context?: SequenceSeekContext) => void;
   onStartPlayback?: () => void;
@@ -658,10 +657,8 @@ export default function Timeline(p: Props) {
       <button onClick={() => { if (edit((project) => deleteClips(project, currentId, [inspectorClip.id]))) setSelected([]); }}>删除</button>
     </div>}
     {showParameters ? <ParameterTimeline
-      motionClips={[]}
-      exprClips={[]}
-      audioClips={[]}
-      subtitleClips={[]}
+      fps={sequence.fps}
+      onExportAnimation={p.onExportAnimation ? options => p.onExportAnimation!(sequence.id, options) : undefined}
       onImportMaterial={(name, kind, start, source) => importMaterialAt(name, kind, start, undefined, source)}
       animation={parameterDocument}
       onAnimationChange={(document) => sequence.kind === "live2d" && p.onSequenceAnimationChange
@@ -673,8 +670,6 @@ export default function Timeline(p: Props) {
       onRedo={p.onRedoProject}
       playheadSec={localTime}
       playheadSourceRef={currentId === p.project.rootSequenceId ? p.playheadSourceRef : localTimeRef}
-      onChangeClip={p.onChangeClip}
-      onRemoveClip={p.onRemoveClip}
       onSetPlayhead={seek}
       isPlaying={p.isPlaying}
       onStartPlayback={p.onStartPlayback}

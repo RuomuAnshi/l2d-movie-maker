@@ -7,6 +7,7 @@ export type Keyframe = Point & {
   outHandle?: Point;
   sourceId?: string;
   sourceKeyId?: string;
+  generated?: boolean;
 };
 export type ParameterDefinition = {
   target: string;
@@ -26,6 +27,8 @@ export type ParameterTrack = {
   baseValue: number;
   animated: boolean;
   keys: Keyframe[];
+  /** Underlying manual animation, retained while material layers cover it. */
+  sourceBase?: { keys: Keyframe[]; animated: boolean };
 };
 export type SourceGroup = {
   id: string;

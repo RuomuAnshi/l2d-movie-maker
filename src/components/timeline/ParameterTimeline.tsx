@@ -1,11 +1,12 @@
 import { useRef, useState, useEffect } from "react";
-import type { Clip, SubtitleClip, TrackKind } from "./clipTypes";
 import {
   animationEnd,
   evaluateTrack,
   sortKeys,
   upsertKey,
   editSource,
+  removeSource,
+  reconcileSourceEdits,
 } from "../../animation/engine";
 import type {
   AnimationDocument,
@@ -17,11 +18,9 @@ import "./parameters.css";
 import NumberField from "./NumberField";
 import { parseMaterialSource } from "../../sequence/materials";
 import type { MaterialSource } from "../../sequence/materials";
+import AnimationExportDialog from "./AnimationExportDialog";
+import type { AnimationExportOptions } from "../../animation/exporters";
 type Props = {
-  motionClips: Clip[];
-  exprClips: Clip[];
-  audioClips: Clip[];
-  subtitleClips: SubtitleClip[];
   onImportMaterial: (
     name: string,
     kind: "motion" | "expression",
@@ -36,19 +35,16 @@ type Props = {
   onRedo: () => void;
   playheadSec: number;
   playheadSourceRef?: { current: number };
-  onChangeClip: (
-    track: TrackKind,
-    id: string,
-    patch: Partial<Pick<Clip, "start" | "duration">>,
-  ) => void;
-  onRemoveClip: (track: TrackKind, id: string) => void;
   onSetPlayhead?: (time: number) => void;
   onStartPlayback?: () => void;
   onStopPlayback?: () => void;
   isPlaying?: boolean;
+  fps?: number;
+  onExportAnimation?: (options: AnimationExportOptions) => Promise<string | undefined>;
 };
 type Selected = { target: string; id: string };
 export default function Timeline(p: Props) {
+  const [exportKind, setExportKind] = useState<"motion" | "expression" | null>(null);
   const [pps, setPps] = useState(80),
     [search, setSearch] = useState(""),
     [onlyAnimated, setOnlyAnimated] = useState(false),
@@ -67,6 +63,7 @@ export default function Timeline(p: Props) {
         ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [graph, focused, selected]);
   const document = p.animation;
+  const applyAnimation = (next: AnimationDocument) => p.onAnimationChange(reconcileSourceEdits(document, next));
   const previousGroupCount = useRef(0);
   useEffect(() => {
     if (!previousGroupCount.current && p.animation.groups.length)
@@ -76,8 +73,6 @@ export default function Timeline(p: Props) {
   const length = Math.max(
     1,
     animationEnd(document),
-    ...p.audioClips.map((c) => c.start + c.duration),
-    ...p.subtitleClips.map((c) => c.start + c.duration),
   );
   const width = Math.max(960, (length + 1) * pps);
   const timeAt = (clientX: number) =>
@@ -92,7 +87,7 @@ export default function Timeline(p: Props) {
     target: string,
     fn: (t: ParameterTrack) => ParameterTrack,
   ) =>
-    p.onAnimationChange({
+    applyAnimation({
       ...document,
       tracks: document.tracks.map((t) =>
         t.definition.target === target ? fn(t) : t,
@@ -121,11 +116,22 @@ export default function Timeline(p: Props) {
     selected.some((s) => s.target === focused && s.id === k.id),
   );
   const group = document.groups.find((g) => g.id === groupId);
+  // Pack overlapping materials into separate compact rows, newest above oldest.
+  const materialLanes: typeof document.groups[] = [];
+  const groupLane = new Map<string, number>();
+  for (const material of document.groups.slice().reverse()) {
+    let lane = materialLanes.findIndex(items => items.every(item =>
+      material.start >= item.start + item.duration || item.start >= material.start + material.duration));
+    if (lane < 0) { lane = materialLanes.length; materialLanes.push([]); }
+    materialLanes[lane].push(material);
+    groupLane.set(material.id, lane);
+  }
+  const materialHeight = Math.max(1, materialLanes.length) * 32;
   const keyPatch = (patch: Partial<Keyframe>) =>
     single(() => {
       const delta =
         patch.time === undefined ? 0 : patch.time - (activeKey?.time ?? 0);
-      p.onAnimationChange({
+      applyAnimation({
         ...document,
         tracks: document.tracks.map((t) => ({
           ...t,
@@ -155,7 +161,7 @@ export default function Timeline(p: Props) {
     });
   const remove = () =>
     single(() =>
-      p.onAnimationChange({
+      applyAnimation({
         ...document,
         tracks: document.tracks.map((t) => ({
           ...t,
@@ -187,7 +193,7 @@ export default function Timeline(p: Props) {
       const earliest = Math.min(...clipboard.current.map((c) => c.key.time));
       if (!Number.isFinite(earliest)) return;
       const shift = p.playheadSec - earliest;
-      p.onAnimationChange({
+      applyAnimation({
         ...document,
         tracks: document.tracks.map((t) => ({
           ...t,
@@ -263,7 +269,7 @@ export default function Timeline(p: Props) {
     );
     drag(event, (dx, dy) => {
       const shift = Math.max(-min, dx);
-      p.onAnimationChange({
+      applyAnimation({
         ...original,
         tracks: original.tracks.map((t) => ({
           ...t,
@@ -423,10 +429,6 @@ export default function Timeline(p: Props) {
     100 -
     (90 * (v - t.definition.min)) /
       Math.max(1e-6, t.definition.max - t.definition.min);
-  const media = [
-    { kind: "audio" as const, clips: p.audioClips, label: "音频" },
-    { kind: "subtitle" as const, clips: p.subtitleClips, label: "字幕" },
-  ];
   return (
     <div
       className="tl-root parameter-timeline"
@@ -472,6 +474,10 @@ export default function Timeline(p: Props) {
           <button className="btn btn--quiet" onClick={p.onRedo}>
             重做
           </button>
+          {p.onExportAnimation && <>
+            <button className="btn btn--quiet" onClick={() => { p.onStopPlayback?.(); setExportKind("motion"); }}>导出动作</button>
+            <button className="btn btn--quiet" onClick={() => { p.onStopPlayback?.(); setExportKind("expression"); }}>导出表情</button>
+          </>}
           <input
             aria-label="搜索参数"
             placeholder="搜索参数"
@@ -617,7 +623,7 @@ export default function Timeline(p: Props) {
                   onChange={(value) => {
                     const speed = Math.max(0.05, value);
                     single(() =>
-                      p.onAnimationChange(
+                      applyAnimation(
                         editSource(document, group.id, {
                           speed,
                           duration: (group.duration * group.speed) / speed,
@@ -631,7 +637,7 @@ export default function Timeline(p: Props) {
                 className="btn btn--quiet"
                 onClick={() =>
                   single(() =>
-                    p.onAnimationChange(
+                    applyAnimation(
                       editSource(document, group.id, {
                         offset: 0,
                         duration: group.sourceDuration / group.speed,
@@ -646,14 +652,7 @@ export default function Timeline(p: Props) {
                 className="btn btn--quiet"
                 onClick={() =>
                   single(() =>
-                    p.onAnimationChange({
-                      ...document,
-                      groups: document.groups.filter((g) => g.id !== group.id),
-                      tracks: document.tracks.map((t) => ({
-                        ...t,
-                        keys: t.keys.filter((k) => k.sourceId !== group.id),
-                      })),
-                    }),
+                    applyAnimation(removeSource(document, group.id)),
                   )
                 }
               >
@@ -663,11 +662,12 @@ export default function Timeline(p: Props) {
           )}
         </div>
       )}
+      {exportKind && p.onExportAnimation && <AnimationExportDialog key={exportKind} kind={exportKind} animation={document} groupId={groupId} time={p.playheadSec} fps={p.fps ?? 30} onClose={() => setExportKind(null)} onExport={p.onExportAnimation} />}
       <div className="parameter-scroll">
         <div className="tl-layout">
           <div className="tl-side parameter-side">
             <div style={{ height: 30 }} />
-            <div style={{ height: 32 }}>素材</div>
+            <div style={{ height: materialHeight }}>素材</div>
             {rows.map((r) => (
               <div
                 key={r.type === "heading" ? r.id : r.track.definition.target}
@@ -759,11 +759,6 @@ export default function Timeline(p: Props) {
                 )}
               </div>
             ))}
-            {media.map((m) => (
-              <div key={m.kind} style={{ height: 36 }}>
-                {m.label}
-              </div>
-            ))}
           </div>
           <div
             className="tl-timearea"
@@ -807,17 +802,18 @@ export default function Timeline(p: Props) {
                   </span>
                 ))}
               </div>
-              <div className="parameter-lane" style={{ height: 32 }}>
+              <div className="parameter-lane" style={{ height: materialHeight }}>
                 {document.groups.map((g) => (
                   <div
                     key={g.id}
-                    className="parameter-source"
-                    style={{ left: g.start * pps, width: g.duration * pps }}
+                    className={`parameter-source ${g.kind}${groupId === g.id ? " selected" : ""}`}
+                    title={`${g.name} · ${g.kind === "motion" ? "动作" : "表情"}`}
+                    style={{ left: g.start * pps, width: g.duration * pps, top: (groupLane.get(g.id) ?? 0) * 32 + 3 }}
                     onMouseDown={(e) => {
                       setGroupId(g.id);
                       setFocused("");
                       drag(e, (dx) =>
-                        p.onAnimationChange(
+                        applyAnimation(
                           editSource(document, g.id, {
                             start: Math.max(0, g.start + dx),
                           }),
@@ -833,7 +829,7 @@ export default function Timeline(p: Props) {
                             -g.start,
                             Math.min(g.duration - 0.01, dx),
                           );
-                          p.onAnimationChange(
+                          applyAnimation(
                             editSource(document, g.id, {
                               start: g.start + shift,
                               offset: Math.max(0, g.offset + shift * g.speed),
@@ -848,7 +844,7 @@ export default function Timeline(p: Props) {
                       className="parameter-edge right"
                       onMouseDown={(e) =>
                         drag(e, (dx) =>
-                          p.onAnimationChange(
+                          applyAnimation(
                             editSource(document, g.id, {
                               duration: Math.max(0.01, g.duration + dx),
                             }),
@@ -999,76 +995,6 @@ export default function Timeline(p: Props) {
                   </div>
                 ),
               )}
-              {media.map((m) => (
-                <div
-                  key={m.kind}
-                  className="parameter-lane"
-                  style={{ height: 36 }}
-                >
-                  {m.clips.map((c) => (
-                    <div
-                      key={c.id}
-                      className={`parameter-source ${m.kind}`}
-                      style={{
-                        left: c.start * pps,
-                        width: Math.max(24, c.duration * pps),
-                      }}
-                      onMouseDown={(e) =>
-                        drag(e, (dx) =>
-                          p.onChangeClip(m.kind, c.id, {
-                            start: Math.max(0, c.start + dx),
-                          }),
-                        )
-                      }
-                    >
-                      <span
-                        className="parameter-edge"
-                        onMouseDown={(e) =>
-                          drag(e, (dx) => {
-                            const shift = Math.max(
-                              -c.start,
-                              Math.min(c.duration - 0.1, dx),
-                            );
-                            p.onChangeClip(m.kind, c.id, {
-                              start: c.start + shift,
-                              duration: c.duration - shift,
-                            });
-                          })
-                        }
-                      />
-                      {m.kind === "audio" && c.waveformPeaks && (
-                        <div className="parameter-waveform" aria-hidden="true">
-                          {c.waveformPeaks.map((peak, i) => (
-                            <i
-                              key={i}
-                              style={{ height: `${Math.max(8, peak * 100)}%` }}
-                            />
-                          ))}
-                        </div>
-                      )}
-                      {c.name}
-                      <button
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onClick={() =>
-                          single(() => p.onRemoveClip(m.kind, c.id))
-                        }
-                      >
-                        ×
-                      </button>
-                      <span
-                        className="parameter-edge right"
-                        onMouseDown={(e) =>
-                          drag(e, (dx) =>
-                            p.onChangeClip(m.kind, c.id, {
-                              duration: Math.max(0.1, c.duration + dx),
-                            }),
-                          )
-                        }
-                      />
-                    </div>
-                  ))}
-                </div>
-              ))}
               <div
                 ref={playheadElement}
                 className="parameter-playhead"

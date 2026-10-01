@@ -3,7 +3,8 @@ import { startTransition, useEffect, useMemo, useRef, useState } from "react";
 import * as PIXI from "pixi.js";
 import { Live2DModel } from "pixi-live2d-display";
 import { emptyAnimation } from '../animation/types';
-import { combineSourceGroups } from '../animation/engine';
+import { combineSourceGroups, reconcileSourceEdits } from '../animation/engine';
+import { exportAnimation, type AnimationExportOptions } from '../animation/exporters';
 import { migrateLegacyClips } from '../animation/migration';
 import { migrateLegacyProject } from '../sequence/migration';
 import { ProjectHistory, sequenceDuration, updateClip, evaluateClipTransform } from '../sequence/engine';
@@ -21,7 +22,7 @@ import { useTimelineDocument } from '../animation/useTimelineDocument';
 import { bakeLipSync, importMaterial } from '../animation/importers';
 import { ModelAdapter, TimelineRenderer } from '../animation/runtime';
 import Timeline from "./timeline/Timeline";
-import type { Clip, SubtitleClip, TrackKind } from "./timeline/clipTypes";
+import type { Clip, SubtitleClip } from "./timeline/clipTypes";
 import { parseMotionDurationSeconds } from "../utils/motionDuration";
 import "./Live2DView.css";
 import "./pixel-theme.css";
@@ -39,7 +40,7 @@ import AlertModal from "./AlertModal";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { dirname, join } from "@tauri-apps/api/path";
-import { remove, writeFile } from "@tauri-apps/plugin-fs";
+import { remove, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { runVideoExport, type VideoExportFormat, type VideoExportMode } from "../utils/videoExporter";
 import {
   buildWebGALExternalAssetUrl as buildExternalAssetUrl,
@@ -946,25 +947,6 @@ export default function Live2DView() {
     audioManager.cleanupAudio();
   };
 
-  const changeClip = (track: TrackKind, id: string, patch: Partial<Pick<Clip, "start" | "duration">>) => {
-    if (track === "motion") setMotionClips(prev => prev.map(c => (c.id === id ? { ...c, ...patch } : c)));
-    else if (track === "expr") setExprClips(prev => prev.map(c => (c.id === id ? { ...c, ...patch } : c)));
-    else if (track === "audio") {
-      setAudioClips(prev => prev.map(c => (c.id === id ? { ...c, ...patch } : c)));
-      setSubtitleClips(prev =>
-        prev.map((clip) => (
-          clip.linkedAudioClipId === id
-            ? {
-                ...clip,
-                ...patch,
-              }
-            : clip
-        )),
-      );
-    }
-    else if (track === "subtitle") setSubtitleClips(prev => prev.map(c => (c.id === id ? { ...c, ...patch } : c)));
-  };
-
   const addSubtitleClip = () => {
     const start = Math.max(timelineLength, nextEnd(subtitleClips));
     const duration = Math.max(0.5, exprDur || motionDur || 2);
@@ -1169,6 +1151,54 @@ export default function Live2DView() {
       changeSequenceProject(nextProject);
       if (kind === "motion") setCurrentMotion(name); else setCurrentExpression(name);
     } catch (error) { showAlert(`导入失败：${error instanceof Error ? error.message : String(error)}`); }
+  };
+
+  const exportSequenceAnimation = async (sequenceId: string, options: AnimationExportOptions): Promise<string | undefined> => {
+    stopPlayback();
+    const projectId = sequenceProjectRef.current.id;
+    await sceneRuntimeRef.current?.prepareSequence(sequenceId, false, options.kind === "motion" ? options.start : options.time);
+    const project = sequenceProjectRef.current;
+    const sequence = project.sequences[sequenceId];
+    if (project.id !== projectId || sequence?.kind !== "live2d") throw new Error("序列已改变，请重新导出。");
+    const adapter = sceneRuntimeRef.current?.getAdapters(sequenceId).find(item => item.tracks.some(track =>
+      track.definition.characterId === options.characterId && track.definition.partId === options.partId));
+    if (!adapter) throw new Error("所选模型部件未加载，请先修复模型素材。");
+    const reference = adapter.modelReference();
+    const file = exportAnimation(sequence.animation, options, reference.cubism);
+    let outputName = options.name, outputPath: string;
+    if (options.destination === "model") {
+      const result = await invoke<{ name: string; filePath: string; relativeFile: string }>("export_animation_to_model", {
+        modelUrl: reference.url, kind: options.kind, name: options.name, text: file.text,
+      });
+      outputName = result.name; outputPath = result.filePath;
+      const adapters = [...(sceneRuntimeRef.current?.getAdapters(sequenceId) ?? []), ...(rendererRef.current?.adapters ?? [])];
+      for (const item of new Set(adapters)) {
+        if (item.modelReference().url === reference.url) item.registerExport(result.name, options.kind, result.relativeFile);
+      }
+      if (rendererRef.current?.adapters.some(item => item.modelReference().url === reference.url) && modelRef.current) {
+        const models = Array.isArray(modelRef.current) ? modelRef.current : [modelRef.current];
+        const data = models.map(readModelDataFromRuntime).filter((item): item is NonNullable<typeof item> => !!item);
+        setModelData({ motions: Object.assign({}, ...data.map(item => item.motions)), expressions: data.flatMap(item => item.expressions) });
+      }
+    } else {
+      const selectedPath = await save({ defaultPath: `${options.name}.${file.extension}`, filters: [{ name: `${options.kind === "motion" ? "Live2D 动作" : "Live2D 表情"} (.${file.extension})`, extensions: [file.extension === "mtn" ? "mtn" : "json"] }] });
+      if (!selectedPath) return undefined;
+      outputPath = selectedPath.toLowerCase().endsWith(`.${file.extension}`) ? selectedPath
+        : file.extension.endsWith(".json") && /\.json$/i.test(selectedPath) ? selectedPath.replace(/\.json$/i, `.${file.extension}`)
+        : `${selectedPath}.${file.extension}`;
+      await writeTextFile(outputPath, file.text);
+    }
+    const source: MaterialSource = {
+      id: `asset:animation-export:${crypto.randomUUID()}`, name: outputName, kind: options.kind,
+      sourceModel: sequence.actors.find(actor => actor.id === options.characterId)?.assetId ?? reference.url,
+      parts: [{ partId: options.partId, uri: "", text: file.text }],
+    };
+    const current = sequenceProjectRef.current;
+    if (current.id === projectId) {
+      const asset = materialSourceToAsset(source);
+      changeSequenceProject({ ...current, assets: { ...current.assets, [asset.id]: { ...asset, metadata: { ...asset.metadata, exported: true } } } });
+    }
+    return `已导出 ${file.parameterCount} 个参数\n${outputPath}`;
   };
 
   useEffect(() => {
@@ -2988,11 +3018,12 @@ export default function Live2DView() {
           assetThumbnails={projectAssetThumbnails}
           onImportMaterial={(name, kind, start, source) => void addMaterial(name, kind, start, source)}
           onImportIntoSequence={importMaterialIntoSequence}
+          onExportAnimation={exportSequenceAnimation}
           onSequenceAnimationChange={(sequenceId, document) => {
             const current = sequenceProjectRef.current;
             const target = current.sequences[sequenceId];
             if (target?.kind !== "live2d") return;
-            changeSequenceProject({ ...current, sequences: { ...current.sequences, [sequenceId]: { ...target, animation: document } } });
+            changeSequenceProject({ ...current, sequences: { ...current.sequences, [sequenceId]: { ...target, animation: reconcileSourceEdits(target.animation, document) } } });
           }}
           animation={animation}
           onAnimationChange={changeAnimation}
@@ -3002,22 +3033,6 @@ export default function Live2DView() {
           onRedo={redo}
           playheadSec={playhead}
           playheadSourceRef={rootPlayheadRef}
-          onChangeClip={changeClip}
-          onRemoveClip={(track, id) => {
-            if (track === "motion") setMotionClips(prev => prev.filter(c => c.id !== id));
-            else if (track === "expr") setExprClips(prev => prev.filter(c => c.id !== id));
-            else if (track === "audio") {
-              setAudioClips(prev => prev.filter(c => c.id !== id));
-              setSubtitleClips(prev => prev.map((clip) => (
-                clip.linkedAudioClipId === id
-                  ? { ...clip, linkedAudioClipId: undefined }
-                  : clip
-              )));
-              audioManager.unregisterAudioElement(id);
-            } else if (track === "subtitle") {
-              removeSubtitleClip(id);
-            }
-          }}
           onSetPlayhead={setPlayheadSec}
           onSeekSequence={seekSequence}
           audioSourceDuration={(clip) => clip.assetId ? sequenceProject.assets[clip.assetId]?.duration : undefined}

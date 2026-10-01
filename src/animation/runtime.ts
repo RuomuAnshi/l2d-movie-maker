@@ -171,6 +171,30 @@ export class ModelAdapter {
     const uri = settings.resolveURL?.(file) ?? new URL(file, base).href;
     return { partId: this.tracks[0].definition.partId, uri };
   }
+  modelReference(): { url: string; cubism: 2 | 3 } {
+    const url = this.model.__compositeResolvedUrl ?? this.model.internalModel.settings.url;
+    if (typeof url !== "string" || !url) throw new Error("无法定位模型配置文件。");
+    const core = this.model.internalModel.coreModel;
+    return { url, cubism: (core._model ?? core).parameters ? 3 : 2 };
+  }
+  registerExport(name: string, kind: "motion" | "expression", file: string) {
+    const cubism = this.modelReference().cubism;
+    const entry = cubism === 3 ? (kind === "motion" ? { File: file } : { Name: name, File: file })
+      : (kind === "motion" ? { file } : { name, file });
+    const manager = this.model.internalModel.motionManager;
+    const settings = this.model.internalModel.settings;
+    if (kind === "motion") {
+      settings.motions ??= {};
+      settings.motions[name] = [entry];
+      manager.definitions ??= settings.motions;
+      manager.definitions[name] = [entry];
+    } else {
+      const definitions = manager.expressionManager?.definitions ?? settings.expressions ?? [];
+      definitions.push(entry);
+      settings.expressions = definitions;
+      if (manager.expressionManager) manager.expressionManager.definitions = definitions;
+    }
+  }
   async material(name: string, kind: "motion" | "expression") {
     const { uri } = this.materialReference(name, kind);
     const response = await fetch(uri);

@@ -96,7 +96,7 @@ export function upsertKey(
   };
 }
 // Split Bezier handles before replacing an interval so the untouched curve stays exact.
-function splitAt(keys: Keyframe[], time: number, base: number): Keyframe[] {
+export function splitAt(keys: Keyframe[], time: number, base: number): Keyframe[] {
   if (keys.some((k) => Math.abs(k.time - time) < 1e-9))
     return keys.map((k) =>
       Math.abs(k.time - time) < 1e-9 ? { ...k, time } : k,
@@ -109,11 +109,12 @@ function splitAt(keys: Keyframe[], time: number, base: number): Keyframe[] {
     time,
     value,
     interpolation: "hold",
+    generated: true,
   };
   if (index < 0) return sortKeys([...keys, point]);
   const a = { ...keys[index] },
     b = { ...keys[index + 1] };
-  if (!b.id) return sortKeys([...keys, point]);
+  if (!b.id) return sortKeys([...keys.slice(0, index), { ...a, interpolation: "hold", outHandle: undefined }, point]);
   point.interpolation = a.interpolation;
   if (a.interpolation === "bezier") {
     const c = a.outHandle ?? {
@@ -154,14 +155,13 @@ function splitAt(keys: Keyframe[], time: number, base: number): Keyframe[] {
     ...keys.slice(index + 2),
   ]);
 }
-export function insertSource(
+function overlaySource(
   document: AnimationDocument,
   group: SourceGroup,
 ): AnimationDocument {
   const end = group.start + group.duration;
   return {
     ...document,
-    groups: [...document.groups.filter((g) => g.id !== group.id), group],
     tracks: document.tracks.map((track) => {
       const source = group.curves[track.definition.target];
       if (!source?.length) return track;
@@ -172,7 +172,7 @@ export function insertSource(
       let mapped: Keyframe[] = source.map((k) => ({
         ...k,
         ...mapPoint(k),
-        id: crypto.randomUUID(),
+        id: `${group.id}:${k.id}`,
         sourceId: group.id,
         sourceKeyId: k.id,
         inHandle: k.inHandle && mapPoint(k.inHandle),
@@ -188,7 +188,9 @@ export function insertSource(
         track.baseValue,
       )
         .filter((k) => k.time >= group.start && k.time <= end)
-        .map((k) => ({ ...k, sourceId: group.id }));
+        .map((k) => ({ ...k, sourceId: group.id,
+          id: k.generated ? `${group.id}:boundary:${track.definition.target}:${k.time}` : k.id,
+        }));
       const old = splitAt(
         splitAt(track.keys, group.start, track.baseValue),
         end,
@@ -200,13 +202,14 @@ export function insertSource(
       if (group.start > 0 && leftBoundary)
         left.push({
           ...leftBoundary,
-          id: crypto.randomUUID(),
+          id: `${group.id}:before:${track.definition.target}`,
+          sourceId: group.id, sourceKeyId: undefined, generated: true,
           time: Math.max(0, group.start - 1e-7),
         });
       const resume = old.find((k) => k.time === end);
       const tail = old.filter((k) => k.time > end);
       if (tail.length && resume)
-        tail.unshift({ ...resume, id: crypto.randomUUID(), time: end + 1e-7 });
+        tail.unshift({ ...resume, id: `${group.id}:after:${track.definition.target}`, sourceId: group.id, sourceKeyId: undefined, generated: true, time: end + 1e-7 });
       return {
         ...track,
         animated: true,
@@ -215,22 +218,40 @@ export function insertSource(
     }),
   };
 }
+/** Material order is insertion priority. Rebuild only when layers change;
+ * preview and export continue to evaluate the resulting parameter tracks. */
+export function rebuildSources(document: AnimationDocument): AnimationDocument {
+  const groupIds = new Set(document.groups.map(g => g.id));
+  const targets = new Set(document.groups.flatMap(g => Object.keys(g.curves)));
+  const base: AnimationDocument = { ...document, tracks: document.tracks.map(track => {
+    const sourceBase = track.sourceBase ?? (targets.has(track.definition.target) ? {
+      keys: track.keys.filter(k => !k.sourceId || !groupIds.has(k.sourceId)),
+      animated: track.animated,
+    } : undefined);
+    return sourceBase ? { ...track, sourceBase, keys: sourceBase.keys, animated: sourceBase.animated } : track;
+  }) };
+  let next = base;
+  for (const group of document.groups) next = overlaySource(next, group);
+  return next;
+}
+export function insertSource(document: AnimationDocument, group: SourceGroup): AnimationDocument {
+  const index = document.groups.findIndex(g => g.id === group.id);
+  const groups = document.groups.slice();
+  if (index < 0) groups.push(group); else groups[index] = group;
+  return rebuildSources({ ...document, groups });
+}
 export function editSource(
   document: AnimationDocument,
   id: string,
   patch: Partial<Pick<SourceGroup, "start" | "duration" | "offset" | "speed">>,
 ) {
-  const source = document.groups.find((g) => g.id === id);
-  if (!source) return document;
-  const cleared = {
-    ...document,
-    groups: document.groups.filter((g) => g.id !== id),
-    tracks: document.tracks.map((t) => ({
-      ...t,
-      keys: t.keys.filter((k) => k.sourceId !== id),
-    })),
-  };
-  return insertSource(cleared, { ...source, ...patch });
+  if (!document.groups.some(g => g.id === id)) return document;
+  return rebuildSources({ ...document, groups: document.groups.map(g => g.id === id ? { ...g, ...patch } : g) });
+}
+export function removeSource(document: AnimationDocument, id: string) {
+  // Seed underlying tracks before removing a legacy group which has no sourceBase yet.
+  const prepared = rebuildSources(document);
+  return rebuildSources({ ...prepared, groups: prepared.groups.filter(g => g.id !== id) });
 }
 export class CommandHistory<T> {
   private past: T[] = [];
@@ -312,8 +333,12 @@ export function reconcileSourceEdits(
       );
       if (!previous || !curves[track.definition.target]) continue;
       let keys = curves[track.definition.target];
-      for (const old of previous.keys.filter((k) => k.sourceId === group.id)) {
-        const current = track.keys.find((k) => k.id === old.id);
+      const newFrames = track.keys.filter(k => !k.sourceId && !previous.keys.some(old => old.id === k.id) &&
+        next.groups.slice().reverse().find(g => g.curves[track.definition.target]?.length && k.time >= g.start && k.time <= g.start + g.duration)?.id === group.id);
+      const frames = previous.keys.filter(k => k.sourceId === group.id && (!k.generated || (k.time >= group.start && k.time <= group.start + group.duration)));
+      for (const old of [...frames, ...newFrames]) {
+        let current = track.keys.find((k) => k.id === old.id);
+        if (newFrames.includes(old)) current = { ...old, sourceId: group.id };
         if (JSON.stringify(old) === JSON.stringify(current)) continue;
         changed = true;
         if (old.sourceKeyId)
@@ -328,6 +353,7 @@ export function reconcileSourceEdits(
             ...current,
             sourceId: undefined,
             sourceKeyId: undefined,
+            generated: false,
           });
           continue;
         }
@@ -344,11 +370,12 @@ export function reconcileSourceEdits(
             id,
             sourceId: undefined,
             sourceKeyId: undefined,
+            generated: false,
             inHandle: current.inHandle && local(current.inHandle),
             outHandle: current.outHandle && local(current.outHandle),
           },
         ]);
-        replacements.set(current.id, { ...current, sourceKeyId: id });
+        replacements.set(current.id, { ...current, generated: false, sourceKeyId: id });
       }
       curves[track.definition.target] = keys;
     }
@@ -360,6 +387,17 @@ export function reconcileSourceEdits(
     tracks: next.tracks.map((t) => ({
       ...t,
       keys: t.keys.map((k) => replacements.get(k.id) ?? k),
+      sourceBase: t.sourceBase && {
+        ...t.sourceBase,
+        animated: t.animated,
+        keys: sortKeys([
+          ...t.sourceBase.keys.filter(k => {
+            const old = before.tracks.find(v => v.definition.target === t.definition.target)?.keys.find(v => v.id === k.id && !v.sourceId);
+            return !old || t.keys.some(v => v.id === k.id && !v.sourceId);
+          }),
+          ...t.keys.map(k => replacements.get(k.id) ?? k).filter(k => !k.sourceId && !k.generated),
+        ]),
+      },
     })),
   };
 }

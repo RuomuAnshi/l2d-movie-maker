@@ -41,7 +41,8 @@ export function isAnimationDocument(
       ![d.min, d.max, d.defaultValue, t.baseValue].every(Number.isFinite) ||
       d.min > d.max ||
       typeof t.animated !== "boolean" ||
-      !keys(t.keys)
+      !keys(t.keys) ||
+      (t.sourceBase != null && (!keys(t.sourceBase.keys) || typeof t.sourceBase.animated !== "boolean"))
     )
       return false;
     targets.add(d.target);

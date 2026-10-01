@@ -78,6 +78,28 @@ fn external_roots() -> &'static Mutex<HashMap<String, PathBuf>> {
     EXTERNAL_ROOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Resolve a model URL owned by our server, including registered project resources.
+pub fn local_model_path(app: &AppHandle, model_url: &str) -> Result<PathBuf, String> {
+    let model_dir = prepare_model_dir(app)?;
+    let port = ensure_model_server_started(model_dir.clone())?;
+    let prefix = format!("http://127.0.0.1:{}/", port);
+    let relative = model_url.strip_prefix(&prefix).ok_or("只能加入当前加载的本地立绘；远程模型请先导入模型库。")?;
+    let relative = relative.split(['?', '#']).next().unwrap_or("");
+    let (root, encoded) = if let Some(path) = relative.strip_prefix("model/") {
+        (model_dir, path.to_string())
+    } else if let Some(path) = relative.strip_prefix("external/") {
+        let (key, path) = path.split_once('/').ok_or("外部模型地址无效")?;
+        let root = external_roots().lock().map_err(|_| "资源注册表不可用")?
+            .get(key).cloned().ok_or("模型资源已失效，请重新打开工程")?;
+        (root, path.to_string())
+    } else { return Err("模型地址无效".into()); };
+    let decoded = urlencoding::decode(&encoded).map_err(|_| "模型地址编码无效")?;
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    let path = canonical_root.join(&*decoded).canonicalize().map_err(|e| format!("无法读取模型配置: {}", e))?;
+    if !path.starts_with(&canonical_root) || !path.is_file() { return Err("模型地址超出资源目录".into()); }
+    Ok(path)
+}
+
 fn hash_root_key(path: &Path) -> String {
     let normalized = path.to_string_lossy().to_lowercase();
     let mut hasher = DefaultHasher::new();

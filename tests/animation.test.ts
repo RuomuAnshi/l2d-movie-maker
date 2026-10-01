@@ -9,6 +9,7 @@ import {
   editSource,
   CommandHistory,
   reconcileSourceEdits,
+  removeSource,
 } from "../src/animation/engine";
 import {
   importMaterial,
@@ -22,6 +23,7 @@ import {
   type ParameterTrack,
 } from "../src/animation/types";
 import { ModelAdapter, TimelineRenderer } from "../src/animation/runtime";
+import { exportAnimation, type AnimationExportOptions } from "../src/animation/exporters";
 const k = (
   time: number,
   value: number,
@@ -352,4 +354,105 @@ test("V2 document rejects malformed keys and duplicate qualified targets", () =>
       tracks: [{ ...track(), keys: [k(NaN, 0)] }],
     }),
   );
+});
+
+test("overlapping materials retain lower curves, insertion priority, manual underlay and undo", () => {
+  const x = { ...track(), keys: [k(0, 0), k(10, 10)] }, y = track("Y");
+  const base = { ...emptyAnimation(), tracks: [x, y] };
+  const a = { id: "a", name: "motion", kind: "motion" as const, start: 1, duration: 5, sourceDuration: 5, offset: 0, speed: 1,
+    curves: { [x.definition.target]: [k(0, 0), k(5, 50)], [y.definition.target]: [k(0, 5), k(5, 5)] } };
+  const first = insertSource(base, a);
+  const second = insertSource(first, { ...a, id: "b", kind: "expression", start: 2, duration: 2, sourceDuration: 2,
+    curves: { [x.definition.target]: [k(0, 80), k(2, 90)] } });
+  near(evaluateTrack(second.tracks[0], 3), 85);
+  near(evaluateTrack(second.tracks[0], 5), 40);
+  near(evaluateTrack(second.tracks[1], 3), 5);
+  const lowerMoved = editSource(second, "a", { start: 0 });
+  assert.deepEqual(lowerMoved.groups.map(g => g.id), ["a", "b"]);
+  near(evaluateTrack(lowerMoved.tracks[0], 3), 85);
+  const moved = editSource(second, "b", { start: 7 });
+  near(evaluateTrack(moved.tracks[0], 3), 20);
+  const removed = removeSource(second, "b");
+  near(evaluateTrack(removed.tracks[0], 3), 20);
+  const original = removeSource(removed, "a");
+  assert.deepEqual(original.tracks[0].keys, base.tracks[0].keys);
+  near(evaluateTrack(original.tracks[0], 3), 3);
+  const history = new CommandHistory<typeof second>(); history.commit(second);
+  assert.deepEqual(evaluateAt(history.undo(removed), 3), evaluateAt(second, 3));
+  const saved = JSON.parse(JSON.stringify(second));
+  near(evaluateTrack(removeSource(saved, "b").tracks[0], 3), 20);
+});
+
+test("manual underlay edits outside source intervals survive rebuild and removal", () => {
+  const t = { ...track(), keys: [k(0, 0), k(10, 10)] };
+  const doc = importMaterial({ ...emptyAnimation(), tracks: [t] }, [t], "$fps=1\nX=20,30", "motion", "m", 3);
+  const edited = reconcileSourceEdits(doc, { ...doc, tracks: [upsertKey(doc.tracks[0], 9, 90)] });
+  const removed = removeSource(edited, edited.groups[0].id);
+  near(evaluateTrack(removed.tracks[0], 9), 90);
+});
+
+const exportOptions: AnimationExportOptions = { name: "test", kind: "motion", characterId: "main", partId: "0", start: 0, end: 2, time: 1, fps: 30, fadeIn: 0.5, scope: "all", destination: "file" };
+test("motion3 export preserves clipped Beziers, hold, inverse hold, opacity and qualified identities", () => {
+  const x = { ...track(), keys: [
+    { ...k(0, 0, "bezier"), outHandle: { time: 0.2, value: 20 } },
+    { ...k(1, 10, "hold"), inHandle: { time: 0.8, value: 30 } }, k(1.4, 40, "inverse-hold"), k(2, 50),
+  ] };
+  const opacity = { ...track("Part"), definition: { ...track("Part").definition, kind: "opacity" as const, min: 0, max: 1 }, keys: [k(0, 1), k(2, 0)] };
+  const other = { ...track(), definition: { ...track().definition, target: targetId("other", "0", "X"), characterId: "other" }, keys: [k(0, 99)] };
+  const doc = { ...emptyAnimation(), tracks: [x, opacity, other] };
+  const result = exportAnimation(doc, { ...exportOptions, start: 0.271, end: 1.9 }, 3);
+  const parsed = parseMotion(result.text), json = JSON.parse(result.text);
+  assert.equal(json.Meta.AreBeziersRestricted, false);
+  assert.equal(result.parameterCount, 2);
+  assert.ok(json.Meta.TotalPointCount > json.Meta.TotalSegmentCount);
+  for (const time of [0.271, 0.5, 0.9, 1, 1.2, 1.4, 1.7, 1.9]) {
+    near(curveValue(parsed.curves["parameter:X"], 0, time - 0.271), evaluateTrack(x, time));
+    near(curveValue(parsed.curves["opacity:Part"], 0, time - 0.271), evaluateTrack(opacity, time));
+  }
+});
+test("motion3 export before first frame uses base, static values clamp and overshoot bakes", () => {
+  const t = { ...track(), baseValue: 2, keys: [k(1, 20), k(2, 40)] };
+  let parsed = parseMotion(exportAnimation({ ...emptyAnimation(), tracks: [t] }, exportOptions, 3).text);
+  near(curveValue(parsed.curves["parameter:X"], 0, 0.5), 2);
+  const overshoot = { ...track(), keys: [k(0, -200), k(2, 200)] };
+  parsed = parseMotion(exportAnimation({ ...emptyAnimation(), tracks: [overshoot] }, exportOptions, 3).text);
+  for (const time of [0, 0.5, 1, 1.5, 2]) near(curveValue(parsed.curves["parameter:X"], 0, time), evaluateTrack(overshoot, time));
+});
+test("Cubism2 motion exports at requested sample rate including part opacity", () => {
+  const t = { ...track(), keys: [k(0, 0), k(2, 48)] };
+  const p = { ...track("P"), definition: { ...track("P").definition, kind: "opacity" as const }, keys: [k(0, 1)] };
+  const exported = exportAnimation({ ...emptyAnimation(), tracks: [t, p] }, { ...exportOptions, fps: 24 }, 2);
+  assert.equal(exported.extension, "mtn");
+  const parsed = parseMotion(exported.text);
+  assert.equal(parsed.curves["parameter:X"].length, 48);
+  near(parsed.curves["parameter:X"][13].value, 13);
+  assert.ok(parsed.curves["opacity:P"]);
+});
+test("expression exports overwrite pose, exclude opacity, and reimport native fade units", () => {
+  for (const cubism of [2, 3] as const) {
+    const t = { ...track(), keys: [k(0, 0), k(2, 40)] };
+    const p = { ...track("P"), definition: { ...track("P").definition, kind: "opacity" as const }, keys: [k(0, 1)] };
+    const result = exportAnimation({ ...emptyAnimation(), tracks: [t, p] }, { ...exportOptions, kind: "expression" }, cubism);
+    assert.equal(result.parameterCount, 1);
+    const imported = importMaterial({ ...emptyAnimation(), tracks: [track()] }, [track()], result.text, "expression", "pose", 0);
+    near(imported.groups[0].duration, 0.5);
+    near(evaluateTrack(imported.tracks[0], 0.5), 20);
+  }
+});
+test("animation export rejects empty selections, wrong parts and invalid ranges", () => {
+  const doc = { ...emptyAnimation(), tracks: [track()] };
+  assert.throws(() => exportAnimation(doc, { ...exportOptions, partId: "missing" }, 3), /没有可导出/);
+  assert.throws(() => exportAnimation(doc, { ...exportOptions, scope: "material" }, 3), /请选择素材/);
+  assert.throws(() => exportAnimation(doc, { ...exportOptions, end: 0 }, 3), /无效/);
+});
+
+test("new parameter frames inside material become editable source curves and survive moving", () => {
+  const t = track();
+  const doc = importMaterial({ ...emptyAnimation(), tracks: [t] }, [t], "$fps=1\nX=0,10,20", "motion", "m", 1);
+  const edited = reconcileSourceEdits(doc, { ...doc, tracks: [upsertKey(doc.tracks[0], 2.25, 77)] });
+  assert.equal(edited.tracks[0].keys.find(k => k.time === 2.25)?.sourceId, doc.groups[0].id);
+  const moved = editSource(edited, doc.groups[0].id, { start: 3 });
+  near(evaluateTrack(moved.tracks[0], 4.25), 77);
+  const extended = editSource(moved, doc.groups[0].id, { duration: 5 });
+  near(evaluateTrack(extended.tracks[0], 8), 20);
 });

@@ -136,7 +136,7 @@ export function importMaterial(
     const params = json.Parameters ?? json.params ?? [];
     sourceDuration = Math.max(
       0,
-      Number(json.FadeInTime ?? json.fade_in ?? 0.5),
+      Number(json.FadeInTime ?? (json.fade_in == null ? 0.5 : json.fade_in / 1000)),
     );
     for (const p of params) {
       const id = p.Id ?? p.id;

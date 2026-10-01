@@ -89,7 +89,8 @@ export function readModelDataFromRuntime(model: unknown): ModelData | null {
   if (!motionManager) return null;
 
   const motions = collectMotions(asRecord(motionManager.definitions));
-  const expressions = collectExpressions(motionManager.expressionManager?.definitions);
+  const settings = asRecord(asRecord(internalModel)?.settings);
+  const expressions = collectExpressions(motionManager.expressionManager?.definitions ?? settings?.expressions);
 
   if (Object.keys(motions).length === 0 && expressions.length === 0) return null;
   return { motions, expressions };
