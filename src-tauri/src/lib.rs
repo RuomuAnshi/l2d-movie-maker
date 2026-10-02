@@ -28,8 +28,11 @@ pub fn run() {
         // 命令
         .invoke_handler(tauri::generate_handler![
             crate::commands::media::encode_png_sequence_to_video,
+            crate::commands::media::cancel_video_export,
+            crate::commands::media::render_audio_rate,
             crate::commands::models::find_live2d_models,
             crate::commands::models::pick_model_source,
+            crate::commands::models::allow_project_write,
             crate::commands::animation::export_animation_to_model,
             crate::commands::server::get_model_server_info,
             crate::commands::server::register_external_asset_root,

@@ -46,7 +46,7 @@ function sampleSchedule(project: ProjectDocument, schedule: ReturnType<typeof re
     if (elapsed < 0 || elapsed >= audio.duration) continue;
     const asset = project.assets[audio.assetId], samples = asset?.lipSync;
     if (!samples?.length) continue;
-    const sampleTime = (audio.sourceIn + elapsed * audio.rate) * (asset.lipSyncSampleRate ?? 120);
+    const sampleTime = (audio.sourceIn + elapsed * audio.rate - (audio.lipSyncOffset ?? 0)) * (asset.lipSyncSampleRate ?? 120);
     if (sampleTime < 0 || sampleTime >= samples.length) continue;
     const index = Math.floor(sampleTime), blend = sampleTime - index;
     const amplitude = samples[index] * (1 - blend) + (samples[index + 1] ?? samples[index]) * blend;

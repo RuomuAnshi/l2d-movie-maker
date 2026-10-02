@@ -52,3 +52,20 @@ export function materialSourceFromAsset(asset: ProjectAsset): MaterialSource | n
   } catch { throw new Error(`素材“${asset.name}”的源文件数据无效。`); }
   return parseMaterialSource({ id: asset.id, name: asset.name, kind: asset.kind, sourceModel: asset.metadata?.sourceModel, parts });
 }
+
+/** Reopening a bundle relocates models, but must not duplicate embedded animation assets. */
+export function mergeMaterialAssets(assets: Record<string, ProjectAsset>, sources: MaterialSource[]): Record<string, ProjectAsset> {
+  const fingerprint = (source: MaterialSource) => JSON.stringify([source.kind, source.name, source.parts.map(part => [part.partId, part.text]).sort((a,b)=>String(a[0]).localeCompare(String(b[0])))]);
+  const known = new Set(Object.values(assets).flatMap(asset => {
+    try { const source=materialSourceFromAsset(asset);return source?[fingerprint(source)]:[]; }
+    catch { return []; } // Keep broken assets available for repair.
+  }));
+  let next=assets;
+  for(const source of sources) {
+    const signature=fingerprint(source);
+    if(next[source.id]||known.has(signature))continue;
+    if(next===assets)next={...assets};
+    next[source.id]=materialSourceToAsset(source);known.add(signature);
+  }
+  return next;
+}

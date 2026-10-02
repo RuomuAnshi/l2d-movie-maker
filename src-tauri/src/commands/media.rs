@@ -1,5 +1,26 @@
 use serde::Deserialize;
-use std::{path::PathBuf, process::Command};
+use std::{path::PathBuf, process::{Command,Stdio}, collections::HashMap, sync::{Arc,Mutex,OnceLock,atomic::{AtomicBool,Ordering}}, io::Read};
+use tauri::Manager;
+static EXPORT_JOBS: OnceLock<Mutex<HashMap<String,Arc<AtomicBool>>>> = OnceLock::new();
+fn jobs()->&'static Mutex<HashMap<String,Arc<AtomicBool>>>{EXPORT_JOBS.get_or_init(||Mutex::new(HashMap::new()))}
+#[tauri::command]
+pub fn cancel_video_export(job_id:String)->Result<(),String>{let mut registry=jobs().lock().map_err(|e|e.to_string())?;registry.entry(job_id).or_insert_with(||Arc::new(AtomicBool::new(false))).store(true,Ordering::SeqCst);Ok(())}
+#[tauri::command]
+pub async fn render_audio_rate(app:tauri::AppHandle,path:String,rate:f64)->Result<String,String>{
+ if !rate.is_finite()||rate<0.03125||rate>64.0{return Err("音频速率范围为 0.03125–64".into());}
+ let root=app.path().app_cache_dir().map_err(|e|e.to_string())?.join("audio-rate");
+ tauri::async_runtime::spawn_blocking(move||{
+  use std::hash::{Hash,Hasher};let info=std::fs::metadata(&path).map_err(|e|e.to_string())?;
+  let mut hash=std::collections::hash_map::DefaultHasher::new();path.hash(&mut hash);info.len().hash(&mut hash);info.modified().ok().hash(&mut hash);rate.to_bits().hash(&mut hash);
+  std::fs::create_dir_all(&root).map_err(|e|e.to_string())?;
+  let file=root.join(format!("{:x}.wav",hash.finish()));if file.is_file(){return Ok(file.to_string_lossy().into_owned());}
+  let nonce=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_nanos();
+  let temp=root.join(format!("{:x}-{}-{nonce}.tmp",hash.finish(),std::process::id()));
+  let result=Command::new("ffmpeg").args(["-v","error","-y","-i",&path,"-af",&atempo_chain(rate),"-ar","48000","-c:a","pcm_f32le","-f","wav"]).arg(&temp).output().map_err(|e|e.to_string())?;
+  if !result.status.success(){let _=std::fs::remove_file(&temp);return Err(String::from_utf8_lossy(&result.stderr).into_owned());}
+  std::fs::rename(&temp,&file).map_err(|e|e.to_string())?;Ok(file.to_string_lossy().into_owned())
+ }).await.map_err(|e|e.to_string())?
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,6 +39,8 @@ struct AudioManifestItem {
     fade_out_sec: f64,
     #[serde(default)]
     gain_envelopes: Vec<AudioGainEnvelope>,
+    #[serde(default)]
+    preserve_pitch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,15 +152,17 @@ pub async fn encode_png_sequence_to_video(
     pattern: String,
     output_path: String,
     format: String,
-    fps: u32,
+    fps: f64,
     target_duration_sec: f64,
     audio_manifest_json: Option<String>,
+    job_id: Option<String>,
 ) -> Result<(), String> {
+    if job_id.as_ref().is_some_and(|id|id.len()>128||!id.chars().all(|c|c.is_ascii_alphanumeric()||c=='-')) {return Err("导出任务标识无效".into());}
     let format = format.to_ascii_lowercase();
     if format != "webm" && format != "mov" {
         return Err(format!("不支持的视频格式: {format}"));
     }
-    let fps = if fps == 0 { 1 } else { fps };
+    let fps = if fps.is_finite() && fps > 0.0 { fps } else { 1.0 };
     let target_duration_sec = if target_duration_sec.is_finite() {
         target_duration_sec.max(0.0)
     } else {
@@ -210,7 +235,7 @@ pub async fn encode_png_sequence_to_video(
                 ),
                 "asetpts=PTS-STARTPTS".to_string(),
             ];
-            if !item.gain_envelopes.is_empty() && (item.playback_rate - 1.0).abs() > 0.00000001 {
+            if (item.preserve_pitch == Some(false) || (item.preserve_pitch.is_none() && !item.gain_envelopes.is_empty())) && (item.playback_rate - 1.0).abs() > 0.00000001 {
                 // V3 preview uses AudioBufferSourceNode.playbackRate. Resampling
                 // preserves the same duration and pitch change in the export.
                 let source_rate = 48000.0 * item.playback_rate;
@@ -323,26 +348,32 @@ pub async fn encode_png_sequence_to_video(
     }
     args.push("-f".into());
     args.push(format.clone());
-    args.push(output_path);
+    let output=PathBuf::from(&output_path);
+    let temp=output.with_file_name(format!("{}.{}.exporting",output.file_name().unwrap_or_default().to_string_lossy(),job_id.as_deref().unwrap_or("legacy")));
+    args.push(temp.to_string_lossy().into_owned());
 
-    let result = Command::new("ffmpeg")
-        .args(args)
-        .output()
-        .map_err(|e| format!("调用 ffmpeg 失败：{e}"))?;
-
-    if !result.status.success() {
-        let diagnostic = String::from_utf8_lossy(&result.stderr);
-        let tail = diagnostic
-            .lines()
-            .rev()
-            .take(12)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!("ffmpeg: 编码 {format} 失败\n{tail}"));
-    }
+    let id=job_id.unwrap_or_else(||format!("legacy-{}",std::process::id()));
+    let cancel=jobs().lock().map_err(|e|e.to_string())?.entry(id.clone()).or_insert_with(||Arc::new(AtomicBool::new(false))).clone();
+    let result=tauri::async_runtime::spawn_blocking(move||{
+        let result=(||{
+            let mut child=Command::new("ffmpeg").args(args).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().map_err(|e|format!("调用 ffmpeg 失败：{e}"))?;
+            let mut stderr=child.stderr.take().ok_or("未获取编码器日志")?;
+            let reader=std::thread::spawn(move||{let mut bytes=Vec::new();let _=stderr.read_to_end(&mut bytes);bytes});
+            let status=loop{
+                if cancel.load(Ordering::SeqCst){let _=child.kill();let _=child.wait();let _=reader.join();return Err("导出已取消".to_string());}
+                if let Some(status)=child.try_wait().map_err(|e|e.to_string())?{break status;}
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            let diagnostic=reader.join().unwrap_or_default();
+            if !status.success(){return Err(format!("编码失败：{}",String::from_utf8_lossy(&diagnostic).lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")));}
+            if cancel.load(Ordering::SeqCst){return Err("导出已取消".into());}
+            std::fs::rename(&temp,&output).map_err(|e|format!("保存视频失败：{e}"))?;Ok(())
+        })();
+        let _=std::fs::remove_file(&temp);
+        if let Ok(mut jobs)=jobs().lock(){jobs.remove(&id);}
+        result
+    }).await.map_err(|e|e.to_string())?;
+    result?;
     Ok(())
 }
 
@@ -450,6 +481,8 @@ mod tests {
             "gainEnvelopes": [{ "gain": 0.8, "keys": [{ "time": -0.1, "value": 0.25 }, { "time": 0.1, "value": 0.75 }],
                 "fadeInStart": -0.05, "fadeInDuration": 0.1, "fadeOutStart": 0.12, "fadeOutDuration": 0.1 }]
         }]).to_string();
+        for preserve in [false,true] {
+        let mut value:serde_json::Value=serde_json::from_str(&manifest).unwrap();value[0]["preservePitch"]=serde_json::json!(preserve);let manifest=value.to_string();
         for format in ["mov", "webm"] {
             let output = dir.join(format!("output.{format}"));
             tauri::async_runtime::block_on(encode_png_sequence_to_video(
@@ -457,9 +490,10 @@ mod tests {
                 "frame-%06d.png".into(),
                 output.to_string_lossy().into(),
                 format.into(),
-                10,
+                10.0,
                 0.2,
                 Some(manifest.clone()),
+                None,
             ))
             .unwrap();
             let probe = Command::new("ffprobe")
@@ -539,10 +573,16 @@ mod tests {
                 .count();
             let frequency = crossings as f64 * 48000.0 / (2.0 * region.len() as f64);
             assert!(
-                (frequency - 880.0).abs() < 30.0,
-                "V3 buffer rate semantics: {format} exported {frequency}Hz instead of 880Hz"
+                (frequency - if preserve {440.0} else {880.0}).abs() < 30.0,
+                "{format} preservePitch={preserve} exported {frequency}Hz"
             );
         }
+        }
+        let output=dir.join("cancel.mov");std::fs::write(&output,b"existing-video").unwrap();
+        let job="native-cancel-test".to_string();cancel_video_export(job.clone()).unwrap();
+        let result=tauri::async_runtime::block_on(encode_png_sequence_to_video(dir.to_string_lossy().into(),"frame-%06d.png".into(),output.to_string_lossy().into(),"mov".into(),10.0,0.2,None,Some(job)));
+        assert!(result.unwrap_err().contains("取消"));assert_eq!(std::fs::read(output).unwrap(),b"existing-video");
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry|entry.unwrap().file_name().to_string_lossy().ends_with("exporting")));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

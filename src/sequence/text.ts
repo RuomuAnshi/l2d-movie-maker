@@ -27,7 +27,7 @@ export function resolveTextSchedule(project: ProjectDocument, sequenceId = proje
   const result: ScheduledText[] = [];
   const visibleRanges = (clip: Clip, offset: number, rate: number, start: number, end: number): Array<[number, number]> => {
     const atSource = (source: number) => ((source - clip.sourceIn) / clip.rate + clip.start - offset) / rate;
-    const boundaries = [start, end, ...clip.transformKeys.map(key => atSource(key.time)).filter(time => time > start && time < end)].sort((a, b) => a - b);
+    const boundaries = [start, end, ...[...clip.transformKeys,...(clip.propertyCurves?.opacity?.keys??[])].map(key => atSource(key.time)).filter(time => time > start && time < end)].sort((a, b) => a - b);
     const ranges: Array<[number, number]> = [];
     for (let index = 1; index < boundaries.length; index++) {
       const left = boundaries[index - 1], right = boundaries[index];

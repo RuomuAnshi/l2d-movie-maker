@@ -63,10 +63,12 @@ export default function AudioManager({
   const mouthAnimationRef = React.useRef<{ audioLevel: number; lastUpdate: number }>({ audioLevel: 0, lastUpdate: 0 });
   const decodedAudioRef = React.useRef<Map<string, { url: string; buffer?: AudioBuffer; promise: Promise<AudioBuffer> }>>(new Map());
   const bufferPlaybackRef = React.useRef<Map<string, BufferPlayback>>(new Map());
+  const outputMeterRef=React.useRef<AnalyserNode|null>(null);
 
   const connectAnalyzerOutputs = (gain: GainNode) => {
     const context = audioContextRef.current;
     if (!context) return;
+    if(outputMeterRef.current){gain.connect(outputMeterRef.current);return;}
     gain.connect(context.destination);
     if (recordingDestinationRef.current) {
       gain.connect(recordingDestinationRef.current);
@@ -84,6 +86,11 @@ export default function AudioManager({
         }
         audioContextRef.current = new AudioContextCtor();
         recordingDestinationRef.current = audioContextRef.current.createMediaStreamDestination();
+        if(typeof audioContextRef.current.createAnalyser === "function"){
+          outputMeterRef.current=audioContextRef.current.createAnalyser();outputMeterRef.current.fftSize=2048;
+          outputMeterRef.current.connect(audioContextRef.current.destination);
+          outputMeterRef.current.connect(recordingDestinationRef.current);
+        }
         createdRecordingDestination = true;
       } catch (error) {
         console.error('�?音频上下文初始化失败:', error);
@@ -95,7 +102,7 @@ export default function AudioManager({
       createdRecordingDestination = true;
     }
 
-    if (createdRecordingDestination) {
+    if (createdRecordingDestination && !outputMeterRef.current) {
       audioAnalyzersRef.current.forEach(({ gain }) => {
         try {
           gain.connect(recordingDestinationRef.current!);
@@ -210,6 +217,8 @@ export default function AudioManager({
   };
 
   const getDecodedAudioBuffer = (assetId: string) => decodedAudioRef.current.get(assetId)?.buffer;
+  const readOutputLevel=()=>{const meter=outputMeterRef.current;if(!meter)return {peak:0,rms:0};const values=new Float32Array(meter.fftSize);meter.getFloatTimeDomainData(values);let peak=0,sum=0;for(const value of values){peak=Math.max(peak,Math.abs(value));sum+=value*value;}return {peak,rms:Math.sqrt(sum/values.length)};};
+  const pruneDecodedAudio=(retained:Set<string>)=>{for(const id of decodedAudioRef.current.keys())if(!retained.has(id)&&![...bufferPlaybackRef.current.values()].some(item=>item.assetId===id))decodedAudioRef.current.delete(id);};
 
   const stopBufferAudio = (id: string) => {
     const playback = bufferPlaybackRef.current.get(id);
@@ -508,6 +517,8 @@ export default function AudioManager({
     setAudioGain,
     prepareAudioBuffer,
     getDecodedAudioBuffer,
+    readOutputLevel,
+    pruneDecodedAudio,
     syncBufferAudio,
     applyMouthAnimation,
     resetMouthAnimation,

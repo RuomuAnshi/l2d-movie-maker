@@ -8,6 +8,9 @@ type Props = {
   kind: "motion" | "expression";
   animation: AnimationDocument;
   groupId?: string;
+  initialDestination?: AnimationExportOptions["destination"];
+  selectedTargets?: string[];
+  characterNames?: Record<string, string>;
   time: number;
   fps: number;
   onClose: () => void;
@@ -23,7 +26,7 @@ export default function AnimationExportDialog(p: Props) {
   const [options, setOptions] = useState<Omit<AnimationExportOptions, "characterId" | "partId">>({
     kind: p.kind, name: group?.name ? `${group.name}_编辑` : p.kind === "motion" ? "新动作" : "新表情",
     start: group?.start ?? 0, end: group ? group.start + group.duration : Math.max(1 / p.fps, animationEnd(p.animation)),
-    time: p.time, fps: p.fps, fadeIn: 0.5, scope: group ? "material" : "animated", groupId: group?.id, destination: "file",
+    time: p.time, fps: p.fps, fadeIn: 0.5, scope: group ? "material" : "animated", groupId: group?.id, destination: p.initialDestination ?? "file",
   });
   const [busy, setBusy] = useState(false), [message, setMessage] = useState("");
   const nameRef = useRef<HTMLInputElement>(null);
@@ -51,11 +54,16 @@ export default function AnimationExportDialog(p: Props) {
     <h3 id="animation-export-title">{p.kind === "motion" ? "导出动作" : "导出表情"}</h3>
     <fieldset disabled={busy}>
       <label>名称<input ref={nameRef} aria-label="动画名称" value={options.name} onChange={event => patch({ name: event.target.value })} /></label>
-      <label>部件<select aria-label="导出部件" value={part} onChange={event => setPart(event.target.value)}>{parts.map(([id, value]) => <option key={id} value={id}>{value.characterId} · {value.partId}</option>)}</select></label>
+      <label>部件<select aria-label="导出部件" value={part} onChange={event => setPart(event.target.value)}>{parts.map(([id, value]) => {
+        const siblings=parts.filter(([,candidate])=>candidate.characterId===value.characterId);
+        const name=p.characterNames?.[value.characterId] ?? (value.characterId==="main"?"角色":value.characterId);
+        return <option key={id} value={id}>{name}{siblings.length>1?` · 部件 ${siblings.findIndex(([key])=>key===id)+1}`:""}</option>;
+      })}</select></label>
       <label>参数<select aria-label="导出参数范围" value={options.scope} onChange={event => patch({ scope: event.target.value as AnimationExportOptions["scope"] })}>{group && <option value="material">所选素材涉及的参数</option>}<option value="animated">已动画或已调整</option><option value="all">全部参数</option></select></label>
       {options.kind === "motion" ? <div className="animation-export-range">{(["start", "end", "fps"] as const).map((key, i) => <label key={key}>{["开始", "结束", "帧率"][i]}<input aria-label={`导出${["开始", "结束", "帧率"][i]}`} type="number" min={key === "fps" ? 1 : 0} step={key === "fps" ? 1 : 0.001} value={options[key]} onChange={event => patch({ [key]: event.target.valueAsNumber })} /></label>)}</div>
       : <div className="animation-export-range"><label>姿态时间<input aria-label="表情姿态时间" type="number" min={0} step={0.001} value={options.time} onChange={event => patch({ time: event.target.valueAsNumber })} /></label><label>淡入<input aria-label="表情淡入" type="number" min={0} step={0.1} value={options.fadeIn} onChange={event => patch({ fadeIn: event.target.valueAsNumber })} /></label></div>}
-      <label>保存到<select aria-label="动画保存位置" value={options.destination} onChange={event => patch({ destination: event.target.value as AnimationExportOptions["destination"] })}><option value="file">文件</option><option value="model">当前部件的立绘</option></select></label>
+      {!!p.selectedTargets?.length&&<label><input type="checkbox" checked={!!options.targets} onChange={event=>patch({targets:event.target.checked?p.selectedTargets:undefined})}/>仅所选参数</label>}
+      <label>保存到<select aria-label="动画保存位置" value={options.destination} onChange={event => patch({ destination: event.target.value as AnimationExportOptions["destination"] })}><option value="file">文件</option><option value="model">当前部件的立绘</option><option value="library">项目素材库</option></select></label>
       <p>{options.kind === "motion" ? "导出范围内的参数曲线。" : "将指定时间的参数值保存为表情。"}{options.destination === "model" ? "新增文件并登记到模型配置，同名时自动编号。" : ""}</p>
     </fieldset>
     {message && <p className="animation-export-result" role="status">{message}</p>}

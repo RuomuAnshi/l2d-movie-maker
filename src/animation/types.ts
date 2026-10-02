@@ -35,6 +35,9 @@ export type SourceGroup = {
   name: string;
   kind: "motion" | "expression";
   sourceAssetId?: string;
+  enabled?: boolean;
+  /** Undefined includes every channel; an empty array excludes every channel. */
+  targetMask?: string[];
   start: number;
   duration: number;
   sourceDuration: number;

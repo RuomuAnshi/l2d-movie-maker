@@ -14,3 +14,28 @@
 .sequence-inspector .sequence-key-button { min-height: 20px; height: 20px; padding: 0 5px; line-height: 18px; }
 .sequence-inspector .sequence-key-button.is-active { background: #d4bd7a; }
 .sequence-inspector-issue { margin: 0; padding: 5px 7px; color: #9f3e2d; background: #eed3a9; font-size: 11px; }
+.property-field { min-width: 0; }
+.property-field-value { display: flex; align-items: end; gap: 3px; }
+.property-field-value > label { flex: 1; min-width: 0; }
+.property-curve-editor { grid-column: 1 / -1; font-size: 11px; margin-top: 6px; }
+.property-curve-editor svg { display: block; width: 100%; max-height: 150px; background: #e7d8ae; cursor: crosshair; touch-action: none; }
+.property-curve-editor circle { cursor: move; }
+.property-curve-editor summary { cursor: pointer; }
+.sequence-edit-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.source-monitor { background: var(--pixel-paper, #efdfb7); padding: 6px 10px; font-size: 11px; }
+.source-monitor header, .source-monitor-tools, .source-range-fields { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.source-monitor header { justify-content: space-between; }
+.source-monitor input[type=range] { width: 100%; }
+.source-range-fields { margin-top: 6px; }
+.source-range-fields input { width: 80px; margin-left: 4px; }
+.audio-meter { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #e8d6a9; font-size: 10px; }
+.audio-meter-bar { flex: 1; height: 6px; position: relative; background: #5a533e; overflow: hidden; }
+.audio-meter-bar i { display: block; height: 100%; background: #648145; }
+.audio-meter-bar b { position: absolute; top: 0; bottom: 0; width: 2px; background: #eccb78; }
+.audio-meter.is-clipped { color: #9b352c; }
+.audio-meter.is-clipped .audio-meter-bar b { background: #ce4534; }
+.recovery-list { max-height: 50vh; overflow: auto; display: grid; gap: 5px; margin: 10px 0; }
+.source-parameter-mask { max-width: 260px; font-size: 11px; }
+.source-parameter-mask[open] { max-height: 220px; overflow: auto; }
+.source-parameter-mask label { display: block; }
+.performance-presets { display: flex; gap: 4px; padding: 3px 6px; }

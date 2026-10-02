@@ -1551,3 +1551,7 @@
   width: 72px;
   background: #8ca85e;
 }
+.editor-topbar-brand h1 { font-size: 16px; margin: 0; }
+.editor-topbar { padding-block: 8px; }
+.monitor-overlay--top .input { min-height: 24px; height: 24px; width: auto; font-size: 11px; padding: 1px 5px; }
+.source-monitor + .audio-meter { margin-top: 0; }

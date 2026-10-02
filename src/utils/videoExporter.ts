@@ -17,6 +17,7 @@ export type AudioTrack = {
   fadeIn?: number;
   fadeOut?: number;
   muted?: boolean;
+  preservePitch?: boolean;
   gainEnvelopes?: AudioGainEnvelope[];
   audioUrl?: string;
   audioPath?: string;
@@ -38,6 +39,9 @@ type VideoExportParams = {
   renderFrame: () => void;
   audioTracks: AudioTrack[];
   includeAudio: boolean;
+  startTime?: number;
+  signal?: AbortSignal;
+  onPhase?: (phase:VideoExportPhase)=>void;
   onProgress?: (payload: ProgressPayload) => void;
 };
 
@@ -52,6 +56,7 @@ export type AudioManifestItem = {
   fadeInSec: number;
   fadeOutSec: number;
   gainEnvelopes?: AudioGainEnvelope[];
+  preservePitch?: boolean;
 };
 
 const blobFromCanvas = (canvas: HTMLCanvasElement) =>
@@ -109,17 +114,59 @@ export function buildAudioManifest(audioTracks: AudioTrack[], _fps: number): Aud
       fadeInSec: Math.max(0, Math.min(duration, Number(track.fadeIn) || 0)),
       fadeOutSec: Math.max(0, Math.min(duration, Number(track.fadeOut) || 0)),
       gainEnvelopes: track.gainEnvelopes,
+      preservePitch: track.preservePitch,
     });
   }
 
   return manifest;
 }
 
+/**
+ * 导出方式：
+ * - `record` 实时录制画布流（仅 WebM），几乎不占磁盘、速度快，但拿不到透明通道；
+ * - `frames` 逐帧 PNG 落盘交给 ffmpeg 编码，慢且吃磁盘，但 WebM/MOV 都能保留 alpha。
+ */
+export type VideoExportMethod = "record" | "frames";
+
+/** 导出进行中的阶段：render 逐帧渲染、encode ffmpeg 编码、record 实时录制。 */
+export type VideoExportPhase = "render" | "encode" | "record";
+
+export type ExportPipeline = {
+  kind: VideoExportMethod;
+  format: VideoExportFormat;
+  /** 与用户选择不一致时的降级说明，直接展示在导出面板；无降级时为 null。 */
+  note: string | null;
+};
+
+/**
+ * 决定实际走哪条导出管线。用户的「方式」选择优先，但以下情况强制逐帧：
+ * MOV（ProRes 4444 + alpha 只能由 ffmpeg 产出）、勾选透明背景、当前环境不支持 WebM 录制。
+ */
+export function resolveExportPipeline(input: {
+  format: VideoExportFormat;
+  method: VideoExportMethod;
+  transparentBg: boolean;
+  recordingSupported: boolean;
+}): ExportPipeline {
+  const { format, method, transparentBg, recordingSupported } = input;
+  if (method === "frames") return { kind: "frames", format, note: null };
+  if (format === "mov") {
+    return { kind: "frames", format, note: "MOV 需要逐帧渲染才能保留 ProRes 4444 与透明通道，已改用逐帧渲染。" };
+  }
+  if (transparentBg) {
+    return { kind: "frames", format, note: "透明背景需要逐帧渲染（PNG → WebM），已改用逐帧渲染。" };
+  }
+  if (!recordingSupported) {
+    return { kind: "frames", format, note: "当前环境不支持 WebM 实时录制，已改用逐帧渲染（PNG → WebM）。" };
+  }
+  return { kind: "record", format, note: null };
+}
+
 export async function runVideoExport(params: VideoExportParams): Promise<{
   duration: number;
   frameCount: number;
 }> {
-  const safeFps = Math.max(1, Math.round(params.fps));
+  const safeFps = Math.max(1, params.fps);
   const totalFrames = Math.max(1, Math.round(params.targetFrameCount));
   const manifest = params.includeAudio ? buildAudioManifest(params.audioTracks, safeFps) : [];
   for (const item of manifest) {
@@ -134,11 +181,16 @@ export async function runVideoExport(params: VideoExportParams): Promise<{
   const pattern = "frame-%06d.png";
 
   await mkdir(frameDir, { recursive: true });
+  const jobId=crypto.randomUUID();
+  const cancelled=()=>{if(params.signal?.aborted)throw new DOMException("导出已取消","AbortError");};
+  const cancelEncode=()=>{void invoke("cancel_video_export",{jobId}).catch(()=>{});};
 
   try {
     for (let i = 0; i < totalFrames; i += 1) {
-      const t = i / safeFps;
+      cancelled();
+      const t = (params.startTime??0) + i / safeFps;
       await params.applyTimelineAtTime(t, true);
+      cancelled();
       params.renderFrame();
 
       const png = await blobFromCanvas(params.canvas);
@@ -154,7 +206,10 @@ export async function runVideoExport(params: VideoExportParams): Promise<{
     }
 
     params.onProgress?.({ frameIndex: totalFrames, totalFrames, timeSec: totalFrames / safeFps });
+    cancelled();params.onPhase?.("encode");
+    params.signal?.addEventListener("abort",cancelEncode,{once:true});
     await invoke("encode_png_sequence_to_video", {
+      jobId,
       frameDir,
       pattern,
       outputPath: params.outputPath,
@@ -163,12 +218,14 @@ export async function runVideoExport(params: VideoExportParams): Promise<{
       targetDurationSec: totalFrames / safeFps,
       audioManifestJson: manifest.length > 0 ? JSON.stringify(manifest) : null,
     });
+    cancelled();
 
     return {
       duration: totalFrames / safeFps,
       frameCount: totalFrames,
     };
   } finally {
+    params.signal?.removeEventListener("abort",cancelEncode);
     try { await remove(frameDir, { recursive: true }); } catch { /* 帧目录清理失败不阻断 */ }
   }
 }

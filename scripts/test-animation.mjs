@@ -10,14 +10,14 @@ import { spawnSync } from "node:child_process";
 const dir = await mkdtemp(join(tmpdir(), "l2d-tests-"));
 try {
   await build({
-    entryPoints: ["tests/animation.test.ts", "tests/real-model.test.ts", "tests/sequence.test.ts", "tests/scene-runtime.test.ts", "tests/text.test.ts", "tests/materials.test.ts"],
+    entryPoints: ["tests/animation.test.ts", "tests/real-model.test.ts", "tests/sequence.test.ts", "tests/scene-runtime.test.ts", "tests/text.test.ts", "tests/materials.test.ts", "tests/canvas-recorder.test.ts", "tests/editing.test.ts", "tests/workflow.test.ts"],
     bundle: true,
     platform: "node",
     format: "esm",
     outdir: dir,
   });
   await build({
-    entryPoints: ["tests/export-storage.test.ts", "tests/buffer-audio.test.ts"],
+    entryPoints: ["tests/export-storage.test.ts", "tests/buffer-audio.test.ts", "tests/recovery.test.ts"],
     bundle: true,
     platform: "node",
     format: "esm",
@@ -57,7 +57,7 @@ try {
   });
   const run = spawnSync(
     process.execPath,
-    ["--test", join(dir, "animation.test.js"), join(dir, "real-model.test.js"), join(dir, "sequence.test.js"), join(dir, "scene-runtime.test.js"), join(dir, "export-storage.test.js"), join(dir, "buffer-audio.test.js"), join(dir, "model-manager.test.js"), join(dir, "text.test.js"), join(dir, "scene-compositor.test.js"), join(dir, "materials.test.js")],
+    ["--test", join(dir, "animation.test.js"), join(dir, "real-model.test.js"), join(dir, "sequence.test.js"), join(dir, "scene-runtime.test.js"), join(dir, "export-storage.test.js"), join(dir, "buffer-audio.test.js"), join(dir, "model-manager.test.js"), join(dir, "text.test.js"), join(dir, "scene-compositor.test.js"), join(dir, "materials.test.js"), join(dir, "canvas-recorder.test.js"), join(dir, "editing.test.js"), join(dir,"workflow.test.js"), join(dir,"recovery.test.js")],
     { stdio: "inherit" },
   );
   process.exitCode = run.status ?? 1;

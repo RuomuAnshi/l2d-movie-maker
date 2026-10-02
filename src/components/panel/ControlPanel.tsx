@@ -6,7 +6,12 @@ import type { ModelPackage } from "../../utils/modelLibrary";
 import type { ProjectAsset } from "../../sequence/types";
 import { materialSourceFromAsset } from "../../sequence/materials";
 import type { MaterialSource } from "../../sequence/materials";
-import type { VideoExportFormat, VideoExportMode } from "../../utils/videoExporter";
+import type {
+  VideoExportFormat,
+  VideoExportMethod,
+  VideoExportMode,
+  VideoExportPhase,
+} from "../../utils/videoExporter";
 
 interface Motion {
   name: string;
@@ -67,6 +72,10 @@ type Props = {
   onImportProjectAudio: () => void;
   onImportProjectImage: () => void;
   onSaveProject: () => void;
+  exportRangeAvailable?:boolean;
+  useMarkedExportRange?:boolean;
+  setUseMarkedExportRange?:(value:boolean)=>void;
+  estimatedStorageBytes?:number;
   onOpenProject: () => void;
   autosaveStatus: string;
 
@@ -126,9 +135,11 @@ type Props = {
   transparentBg: boolean;
   setTransparentBg: (transparent: boolean) => void;
   exportState: "idle" | "done" | "exporting";
+  exportPhase: VideoExportPhase;
   exportTime: number;
   exportProgress: number;
-  onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => void;
+  onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean, method: VideoExportMethod) => void;
+  onCancelExport: () => void;
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
@@ -272,15 +283,18 @@ export default function ControlPanel(props: Props) {
     transparentBg,
     setTransparentBg,
     exportState,
+    exportPhase,
     exportTime,
     exportProgress,
     onExportVideo,
+    onCancelExport,
     onExportSubtitlesSrt,
     onTakeScreenshot,
     onTakePartsScreenshots,
   } = props;
 
   const [motionQuery, setMotionQuery] = useState("");
+  const [projectAssetQuery,setProjectAssetQuery]=useState("");
   const [motionPage, setMotionPage] = useState(1);
   const [motionPageSize, setMotionPageSize] = useState(12);
 
@@ -293,6 +307,7 @@ export default function ControlPanel(props: Props) {
   const activeInspectorTab = visibleInspectorTabs.some((tab) => tab.id === requestedInspectorTab) ? requestedInspectorTab : visibleInspectorTabs[0]?.id ?? "export";
   const subtitleTabEnabled = visibleInspectorTabs.some((tab) => tab.id === "subtitle");
   const [exportFormat, setExportFormat] = useState<VideoExportFormat>("webm");
+  const [exportMethod, setExportMethod] = useState<VideoExportMethod>("record");
   const [exportMode, setExportMode] = useState<VideoExportMode>("all");
   const [includeExportAudio, setIncludeExportAudio] = useState(true);
   const [availableSubtitleFonts, setAvailableSubtitleFonts] = useState<string[]>(FALLBACK_SUBTITLE_FONTS);
@@ -620,8 +635,9 @@ export default function ControlPanel(props: Props) {
                 <button className="btn btn--quiet" onClick={onImportProjectAudio}>导入音频</button>
                 <button className="btn btn--quiet" onClick={onImportProjectImage}>导入图片</button>
               </div>
+              <input className="input input--full" aria-label="素材搜索" placeholder="搜索素材" value={projectAssetQuery} onChange={event=>setProjectAssetQuery(event.target.value)}/>
               {projectAssets.length ? <div className="model-library-list">
-                {projectAssets.map((asset) => <div key={asset.id} className="project-asset-row" style={{ display: "flex", alignItems: "center", gap: 4 }}><button
+                {projectAssets.filter(asset=>asset.name.toLowerCase().includes(projectAssetQuery.trim().toLowerCase())).map((asset) => <div key={asset.id} className="project-asset-row" style={{ display: "flex", alignItems: "center", gap: 4 }}><button
                   className={`model-library-entry${selectedProjectAssetId === asset.id ? " is-active" : ""}`}
                   style={{ flex: 1, minWidth: 0 }}
                   draggable
@@ -920,6 +936,7 @@ export default function ControlPanel(props: Props) {
               <>
                 <PanelSection title="导出视频">
                   <ExportToolbar
+                    exportRangeAvailable={props.exportRangeAvailable} useMarkedExportRange={props.useMarkedExportRange} setUseMarkedExportRange={props.setUseMarkedExportRange} estimatedStorageBytes={props.estimatedStorageBytes}
                     recordingQuality={recordingQuality}
                     setRecordingQuality={setRecordingQuality}
                     transparentBg={transparentBg}
@@ -928,12 +945,16 @@ export default function ControlPanel(props: Props) {
                     setIncludeAudio={setIncludeExportAudio}
                     exportFormat={exportFormat}
                     setExportFormat={setExportFormat}
+                    exportMethod={exportMethod}
+                    setExportMethod={setExportMethod}
                     exportMode={exportMode}
                     setExportMode={setExportMode}
                     exportState={exportState}
+                    exportPhase={exportPhase}
                     exportTime={exportTime}
                     exportProgress={exportProgress}
                     onExportVideo={onExportVideo}
+                    onCancelExport={onCancelExport}
                     onExportSubtitlesSrt={onExportSubtitlesSrt}
                     onTakeScreenshot={onTakeScreenshot}
                     onTakePartsScreenshots={onTakePartsScreenshots}

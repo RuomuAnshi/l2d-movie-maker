@@ -1,5 +1,6 @@
 import { sampleVolumeKeys } from "./engine";
 import type { Clip, ProjectDocument } from "./types";
+import { volumeCurveSamples } from "./properties";
 
 /** Times are output seconds relative to the flattened audio item's start. */
 export type AudioGainEnvelope = {
@@ -25,6 +26,8 @@ export type ScheduledAudio = {
   muted: boolean;
   gainEnvelopes?: AudioGainEnvelope[];
   lipSyncActorId?: string;
+  lipSyncOffset?: number;
+  preservePitch?: boolean;
   sequencePath?: string[];
 };
 
@@ -41,7 +44,7 @@ export function resolveAudioSchedule(project: ProjectDocument, sequenceId = proj
     const fadeOutDuration = clip.fadeOut * region.rate / sourceRate;
     return {
       gain: clip.volume,
-      keys: clip.volumeKeys.map((key) => ({ time: atSource(key.time), value: key.value })),
+      keys: volumeCurveSamples(clip).map((key) => ({ time: atSource(key.time), value: key.value })),
       fadeInStart, fadeInDuration,
       fadeOutStart: fadeOutEnd - fadeOutDuration, fadeOutDuration,
     };
@@ -56,6 +59,7 @@ export function resolveAudioSchedule(project: ProjectDocument, sequenceId = proj
     inheritedMuted: boolean,
     envelopes: AudioGainEnvelope[],
     ancestors: Set<string>,
+    preservePitch = true,
   ) => {
     if (ancestors.has(id)) throw new Error("不能解析循环嵌套序列的音频。");
     const sequence = project.sequences[id];
@@ -70,7 +74,7 @@ export function resolveAudioSchedule(project: ProjectDocument, sequenceId = proj
         const clipEnvelopes = [...envelopes, envelopeFor(clip, localOffset, localRate)];
         if (clip.sequenceId) {
           const childOffset = clip.sourceIn + (localOffset - clip.start) * clip.rate;
-          walk(clip.sequenceId, childOffset, localRate * clip.rate, clipRootStart, clipRootEnd, [...path, clip.id], muted, clipEnvelopes, nextAncestors);
+          walk(clip.sequenceId, childOffset, localRate * clip.rate, clipRootStart, clipRootEnd, [...path, clip.id], muted, clipEnvelopes, nextAncestors, preservePitch && (clip.preservePitch === true || Math.abs(clip.rate-1)<1e-8));
           continue;
         }
         if (clip.kind !== "audio" || !clip.assetId) continue;
@@ -85,6 +89,7 @@ export function resolveAudioSchedule(project: ProjectDocument, sequenceId = proj
           start: clipRootStart, duration, sourceIn, rate, gain: clip.volume,
           fadeIn: clip.fadeIn / localRate, fadeOut: clip.fadeOut / localRate, muted,
           lipSyncActorId: clip.lipSyncActorId, sequencePath: [...path],
+          lipSyncOffset: clip.lipSyncOffset ?? 0, preservePitch: preservePitch && clip.preservePitch === true,
           gainEnvelopes: clipEnvelopes.map((envelope) => ({
             ...envelope,
             keys: envelope.keys.map((key) => ({ ...key, time: key.time - clipRootStart })),

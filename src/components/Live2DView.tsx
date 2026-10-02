@@ -11,9 +11,8 @@ import { ProjectHistory, sequenceDuration, updateClip, evaluateClipTransform } f
 import { SceneRuntime } from '../sequence/sceneRuntime';
 import { getSceneLipAt } from '../sequence/sceneAudio';
 import { resolveTextSchedule } from '../sequence/text';
-import { materialSourceFromAsset, materialSourceToAsset, parseMaterialSource, type MaterialSource } from '../sequence/materials';
+import { materialSourceFromAsset, materialSourceToAsset, mergeMaterialAssets, parseMaterialSource, type MaterialSource } from '../sequence/materials';
 import type { ProjectDocument } from '../sequence/types';
-import { createClip, createEditSequence } from '../sequence/types';
 import type { ProjectAsset } from '../sequence/types';
 import { syncLegacyMedia } from '../sequence/syncLegacy';
 import { audioGainAt, resolveAudioSchedule } from '../sequence/audio';
@@ -27,6 +26,13 @@ import { parseMotionDurationSeconds } from "../utils/motionDuration";
 import "./Live2DView.css";
 import "./pixel-theme.css";
 import ControlPanel, { type InspectorTab } from "./panel/ControlPanel";
+import AudioMeter from "./panel/AudioMeter";
+import { editPropertiesAt } from "../sequence/properties";
+import { sliceExportAudio, estimateFrameStorage } from "../utils/exportRange";
+import RecoveryDialog from "./panel/RecoveryDialog";
+import { projectSignature, saveRecovery } from "../utils/projectRecovery";
+import SourceMonitor from "./panel/SourceMonitor";
+import { sourcePreviewProject } from "../sequence/sourcePreview";
 import SequenceInspector from "./panel/SequenceInspector";
 import ModelManager from "./ModelManager";
 import type { JsonlLive2DModel } from "./ModelManager";
@@ -40,8 +46,16 @@ import AlertModal from "./AlertModal";
 import { invoke } from "@tauri-apps/api/core";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { dirname, join } from "@tauri-apps/api/path";
-import { remove, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import { runVideoExport, type VideoExportFormat, type VideoExportMode } from "../utils/videoExporter";
+import { copyFile, exists, rename, remove, writeFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import {
+  resolveExportPipeline,
+  runVideoExport,
+  type VideoExportFormat,
+  type VideoExportMethod,
+  type VideoExportMode,
+  type VideoExportPhase,
+} from "../utils/videoExporter";
+import { createCanvasStreamRecorder, estimateRecordingVideoBitrate, getWebmRecordingSupport } from "../utils/canvasRecorder";
 import {
   buildWebGALExternalAssetUrl as buildExternalAssetUrl,
   // loadWebGALMotionDurations,
@@ -185,9 +199,21 @@ export default function Live2DView() {
 
   // ????? ???//
   const [exportState, setExportState] = useState<"idle" | "done" | "exporting">("idle");
+  const exportAbortRef=useRef<AbortController|null>(null);
+  const [exportIssue,setExportIssue]=useState("");
+  const retryExportRef=useRef<(()=>void)|null>(null);
+  const [markedExportRange,setMarkedExportRange]=useState<{sequenceId:string;start:number;end:number}>();
+  const [useMarkedExportRange,setUseMarkedExportRange]=useState(false);
+  const [audioPreparing,setAudioPreparing]=useState(false);
+  const audioStartRevision=useRef(0);
+  const pitchBuffers=useRef(new Map<string,{uri:string;key:string}>());
+  const [exportPhase, setExportPhase] = useState<VideoExportPhase>("render");
   const exportInProgressRef = useRef(false);
   const [exportTime, setExportTime] = useState(0);
   const [exportProgress, setExportProgress] = useState(0);
+  // 实时录制：取消标记 + 录制循环的 rAF 句柄。
+  const recordingCancelRef = useRef(false);
+  const recordingRafRef = useRef<number | null>(null);
   const [transparentBg, setTransparentBg] = useState(true);
   
   // ????????????????//
@@ -220,16 +246,28 @@ export default function Live2DView() {
   const sequenceProjectRef = useRef(sequenceProject);
   sequenceProjectRef.current = sequenceProject;
   const previewContextRef = useRef<{ sequenceId: string; time: number; rootTime?: number; finalComposition?: boolean; instancePath?: string[] }>({ sequenceId: sequenceProject.rootSequenceId, time: 0 });
+  const [previewQuality,setPreviewQuality]=useState(1);
+  const [cacheBudget,setCacheBudget]=useState(256);
+  const [showPreviewInfo,setShowPreviewInfo]=useState(false);
   const [previewSequenceId, setPreviewSequenceId] = useState(sequenceProject.rootSequenceId);
   const [previewSequenceTime, setPreviewSequenceTime] = useState(0);
   const [previewFinalComposition, setPreviewFinalComposition] = useState(false);
   const [navigationResetKey, setNavigationResetKey] = useState(0);
-  const [sequenceSelection, setSequenceSelection] = useState<{ sequenceId: string; clipIds: string[]; actorId?: string }>({ sequenceId: sequenceProject.rootSequenceId, clipIds: [] });
+  const [sequenceSelection, setSequenceSelection] = useState<{ sequenceId: string; clipIds: string[]; actorId?: string; trackId?: string }>({ sequenceId: sequenceProject.rootSequenceId, clipIds: [] });
+  const [linkedClipSelection, setLinkedClipSelection] = useState(true);
   const sequenceSelectionRef = useRef(sequenceSelection);
   sequenceSelectionRef.current = sequenceSelection;
   const rootPlayheadRef = useRef(0);
   const libraryPreviewRef = useRef(false);
   const [selectedProjectAssetId, setSelectedProjectAssetId] = useState<string>();
+  const [projectPath,setProjectPath]=useState<string>();
+  const [savedSignature,setSavedSignature]=useState("");
+  const savingRef=useRef(false);
+  const [saveBusy,setSaveBusy]=useState(false);
+  const [saveIssue,setSaveIssue]=useState("");
+  const [showRecovery,setShowRecovery]=useState(false);
+  const [assetInsertRequest,setAssetInsertRequest]=useState<{assetId:string;serial:number}>();
+  const sourcePreviewRevision=useRef(0);
   const [projectAssetThumbnails, setProjectAssetThumbnails] = useState<Record<string, string>>({});
   const previewSeekRevisionRef = useRef(0);
   const sceneAudioCacheRef = useRef(new WeakMap<ProjectDocument, Map<string, { signature: string; sample: ReturnType<typeof getSceneLipAt> }>>());
@@ -282,7 +320,7 @@ export default function Live2DView() {
     const committed = projectGestureRef.current ? next : sequenceHistoryRef.current!.execute(() => next);
     sequenceProjectRef.current = committed;
     reconcilePreviewContext(committed);
-    sceneRuntimeRef.current?.setProject(committed);
+    if(!libraryPreviewRef.current)sceneRuntimeRef.current?.setProject(committed);
     setSequenceProject(committed);
     syncLegacyMediaFromSequence(committed);
   };
@@ -328,7 +366,9 @@ export default function Live2DView() {
     if (next !== current) changeSequenceProject(next);
   }, [audioClips, subtitleClips, projectHydrated]);
 
+  useEffect(()=>{sceneRuntimeRef.current?.setPreviewQuality(previewQuality);sceneRuntimeRef.current?.setCacheBudget(cacheBudget);sceneRuntimeRef.current?.refreshPreview();},[previewQuality,cacheBudget]);
   useEffect(() => {
+    if(libraryPreviewRef.current)return;
     sceneRuntimeRef.current?.setProject(sequenceProject);
     if (!isPlayingRef.current) void applyTimelineAtTime(previewContextRef.current.time);
   }, [sequenceProject]);
@@ -1050,13 +1090,13 @@ export default function Live2DView() {
     const results = await Promise.allSettled(sources.map(loadMaterialSource));
     const current = sequenceProjectRef.current;
     if (current.id !== projectId) return;
-    const assets = { ...current.assets };
-    let changed = false;
-    for (const result of results) {
-      if (result.status === "fulfilled") { assets[result.value.id] = materialSourceToAsset(result.value); changed = true; }
-      else console.warn("读取素材来源失败", result.reason);
+    const loaded:MaterialSource[]=[];
+    for(const result of results) {
+      if(result.status==="fulfilled")loaded.push(result.value);
+      else console.warn("读取素材来源失败",result.reason);
     }
-    if (!changed) return;
+    const assets=mergeMaterialAssets(current.assets,loaded);
+    if(assets===current.assets)return;
     const next = { ...current, assets };
     sequenceProjectRef.current = next;
     sequenceHistoryRef.current?.replaceCurrent(next);
@@ -1180,6 +1220,8 @@ export default function Live2DView() {
         const data = models.map(readModelDataFromRuntime).filter((item): item is NonNullable<typeof item> => !!item);
         setModelData({ motions: Object.assign({}, ...data.map(item => item.motions)), expressions: data.flatMap(item => item.expressions) });
       }
+    } else if(options.destination === "library") {
+      outputPath="项目素材库";
     } else {
       const selectedPath = await save({ defaultPath: `${options.name}.${file.extension}`, filters: [{ name: `${options.kind === "motion" ? "Live2D 动作" : "Live2D 表情"} (.${file.extension})`, extensions: [file.extension === "mtn" ? "mtn" : "json"] }] });
       if (!selectedPath) return undefined;
@@ -1191,7 +1233,7 @@ export default function Live2DView() {
     const source: MaterialSource = {
       id: `asset:animation-export:${crypto.randomUUID()}`, name: outputName, kind: options.kind,
       sourceModel: sequence.actors.find(actor => actor.id === options.characterId)?.assetId ?? reference.url,
-      parts: [{ partId: options.partId, uri: "", text: file.text }],
+      parts: [{ partId: String(adapter.model.__jsonlRoleMeta?.index ?? adapter.index), uri: "", text: file.text }],
     };
     const current = sequenceProjectRef.current;
     if (current.id === projectId) {
@@ -1262,18 +1304,14 @@ export default function Live2DView() {
     return audioManager.registerAudioElement(clipId, audioUrl);
   };
 
-  const syncPreviewAudioAtTime = (timeSec: number) => {
-    audioManager.syncBufferAudio(audioSchedule.map((clip) => {
-      const elapsed = timeSec - clip.start;
-      return {
-        id: clip.id, assetId: clip.assetId,
-        sourceTime: clip.sourceIn + Math.max(0, elapsed) * clip.rate,
-        rate: clip.rate, gain: clip.muted ? 0 : audioGainAt(clip, elapsed),
-        active: !clip.muted && elapsed >= 0 && elapsed < clip.duration,
-        remainingDuration: clip.duration - elapsed,
-      };
-    }), isPlayingRef.current);
+  const playbackAudioItem=(clip:ReturnType<typeof resolveAudioSchedule>[number],time:number)=>{
+    const elapsed=time-clip.start,sourceTime=clip.sourceIn+Math.max(0,elapsed)*clip.rate;
+    const key=`pitch:${clip.assetId}:${clip.rate}`;
+    const pitched=clip.preservePitch!==false&&Math.abs(clip.rate-1)>1e-8;
+    const ready=pitchBuffers.current.get(key)?.uri===sequenceProjectRef.current.assets[clip.assetId]?.uri;
+    return {id:clip.id,assetId:pitched?key:clip.assetId,sourceTime:pitched?sourceTime/clip.rate:sourceTime,rate:pitched?1:clip.rate,gain:clip.muted?0:audioGainAt(clip,elapsed),active:(!pitched||ready)&&!clip.muted&&elapsed>=0&&elapsed<clip.duration,remainingDuration:clip.duration-elapsed};
   };
+  const syncPreviewAudioAtTime=(timeSec:number)=>audioManager.syncBufferAudio(audioSchedule.map(clip=>playbackAudioItem(clip,timeSec)),isPlayingRef.current);
 
   const prepareSequenceAudio = async (sequenceId: string, strict = false) => {
     const project = sequenceProjectRef.current;
@@ -1296,6 +1334,17 @@ export default function Live2DView() {
       sequenceHistoryRef.current?.replaceCurrent(next);
       setSequenceProject(next);
     }));
+    const retained=new Set(schedule.map(item=>item.assetId));
+    const rates = [...new Map(schedule.filter(item=>!item.muted&&item.preservePitch&&Math.abs(item.rate-1)>1e-8).map(item=>[`${item.assetId}:${item.rate}`,item])).values()];
+    await Promise.all(rates.map(async item=>{
+      const asset=project.assets[item.assetId];if(!asset?.uri||asset.missing)return;
+      const key=`pitch:${item.assetId}:${item.rate}`;retained.add(key);
+      if(pitchBuffers.current.get(key)?.uri===asset.uri&&audioManager.getDecodedAudioBuffer(key))return;
+      const path=await invoke<string>("render_audio_rate",{path:asset.uri,rate:item.rate});
+      await audioManager.prepareAudioBuffer(key,await buildExternalAssetUrl(await dirname(path),path));
+      pitchBuffers.current.set(key,{uri:asset.uri,key});
+    }));
+    audioManager.pruneDecodedAudio(retained);
   };
 
   // ????????
@@ -1305,13 +1354,11 @@ export default function Live2DView() {
       if (typeof picked !== "string") return;
       const managedPath = await storeAudioAsset(picked);
       const audioUrl = await buildExternalAssetUrl(await dirname(managedPath), managedPath);
-      const audio = new Audio(audioUrl);
-      audio.crossOrigin = "anonymous";
-      await new Promise<void>((resolve, reject) => { audio.onloadedmetadata = () => resolve(); audio.onerror = () => reject(new Error("无法读取音频信息")); audio.load(); });
       const name = picked.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, "") || "音频";
       const id = `asset:audio:${crypto.randomUUID()}`;
+      const buffer=await audioManager.prepareAudioBuffer(id,audioUrl);
       const project = sequenceProjectRef.current;
-      changeSequenceProject({ ...project, assets: { ...project.assets, [id]: { id, kind: "audio", name, uri: managedPath, duration: audio.duration } } });
+      changeSequenceProject({ ...project, assets: { ...project.assets, [id]: { id, kind: "audio", name, uri: managedPath, duration: buffer.duration, lipSync:bakeLipSync(buffer),lipSyncSampleRate:120,waveformPeaks:buildWaveformPeaks(buffer) } } });
     } catch (error) { showAlert(`导入音频失败：${error instanceof Error ? error.message : String(error)}`); }
   };
 
@@ -1344,7 +1391,6 @@ export default function Live2DView() {
     stopPlayback(); libraryPreviewRef.current = true; setSelectedProjectAssetId(asset.id); setModelVisibility(false);
     try {
       if (asset.missing) { showAlert("素材缺失，请点击替换。"); return; }
-      const project = sequenceProjectRef.current;
       const runtime = sceneRuntimeRef.current;
       if (!runtime) return;
       if (asset.kind === "motion" || asset.kind === "expression") {
@@ -1354,17 +1400,34 @@ export default function Live2DView() {
         await previewMaterialSource(source);
         return;
       }
-      if (asset.kind === "sequence" && typeof asset.metadata?.sequenceId === "string") {
-        runtime.setProject(project); await runtime.seekSceneAt(asset.metadata.sequenceId, 0, { lipAt: getSceneLipAt(project, asset.metadata.sequenceId) }); return;
-      }
       if (asset.kind === "audio") { runtime.setVisible(false); return; }
-      const sequence = createEditSequence("素材预览", { width: project.width, height: project.height, fps: project.fps });
-      sequence.tracks[0].clips = [createClip({ kind: asset.kind === "text" ? "text" : "image", name: asset.name, assetId: asset.id, text: asset.name, start: 0, duration: 5 })];
-      const preview = { ...project, sequences: { ...project.sequences, [sequence.id]: sequence } };
-      runtime.setProject(preview); await runtime.seekSceneAt(sequence.id, 0);
+      await seekSourceAsset(asset,0);
     } catch (error) { showAlert(`素材预览失败：${String(error)}`); }
   };
 
+  const sourceAudioRevision=useRef(0);
+  const playSourceAudio=async (asset:ProjectAsset,time:number,playing:boolean)=>{
+    const revision=++sourceAudioRevision.current;
+    if(!playing){audioManager.syncBufferAudio([],false);return;}
+    const url=projectAssetThumbnails[asset.id];if(!url)return;
+    await audioManager.resumeAudioContext();
+    const buffer=await audioManager.prepareAudioBuffer(asset.id,url);
+    if(revision!==sourceAudioRevision.current||!libraryPreviewRef.current)return;
+    audioManager.syncBufferAudio([{id:`source:${asset.id}`,assetId:asset.id,sourceTime:time,rate:1,gain:1,active:true,remainingDuration:Math.max(0,buffer.duration-time)}],true);
+  };
+  const sourcePreviewCache=useRef<{project:ProjectDocument;asset:ProjectAsset;preview:ReturnType<typeof sourcePreviewProject>}|undefined>(undefined);
+  const seekSourceAsset = async (asset:ProjectAsset,time:number) => {
+    const revision=++sourcePreviewRevision.current;
+    const runtime=sceneRuntimeRef.current;if(!runtime||!libraryPreviewRef.current)return;
+    const project=sequenceProjectRef.current;
+    if(sourcePreviewCache.current?.project!==project||sourcePreviewCache.current.asset!==asset)sourcePreviewCache.current={project,asset,preview:sourcePreviewProject(project,asset)};
+    const preview=sourcePreviewCache.current.preview;
+    runtime.setProject(preview.project);
+    await runtime.seekSceneAt(preview.sequenceId,time,{lipAt:getSceneLipAt(preview.project,preview.sequenceId)});
+    if(revision!==sourcePreviewRevision.current)return;
+  };
+  const changeSourceRange=(asset:ProjectAsset,start:number,end:number)=>{const current=sequenceProjectRef.current;changeSequenceProject({...current,assets:{...current.assets,[asset.id]:{...asset,metadata:{...asset.metadata,sourceIn:start,sourceOut:end}}}});};
+  const closeSourcePreview=()=>{libraryPreviewRef.current=false;setSelectedProjectAssetId(undefined);sceneRuntimeRef.current?.setProject(sequenceProjectRef.current);void applyTimelineAtTime(previewContextRef.current.time);};
   const repairProjectAsset = async (assetId: string) => {
     const sourceProject = sequenceProjectRef.current;
     const asset = sourceProject.assets[assetId];
@@ -1485,7 +1548,7 @@ export default function Live2DView() {
     const renderTime = !offline && context.finalComposition && context.rootTime != null ? context.rootTime : t;
     const runtime = sceneRuntimeRef.current;
     if (!runtime) return;
-    if (!offline && libraryPreviewRef.current) { runtime.setVisible(false); return; }
+    if (!offline && libraryPreviewRef.current) return;
     runtime.setProject(project);
     setModelVisibility(false);
     renderSubtitleClip(null);
@@ -1561,24 +1624,19 @@ export default function Live2DView() {
     rafRef.current = requestAnimationFrame(tick);
   };
 
-  const startPlayback = () => {
-    if (exportInProgressRef.current) return;
-    canvasEditCancelRef.current?.();
-    const activeDuration = sequenceDuration(sequenceProjectRef.current.sequences[previewContextRef.current.sequenceId]);
-    if (isPlaying || activeDuration <= 0) return;
-    libraryPreviewRef.current = false;
-    void audioManager.resumeAudioContext();
-    if (previewRafRef.current != null) cancelAnimationFrame(previewRafRef.current);
-    previewRafRef.current = null;
-    if (playheadRef.current >= activeDuration) playheadRef.current = 0;
-    playheadUiLastTsRef.current = null;
-    isPlayingRef.current = true;
-    setIsPlaying(true);
-    startTsRef.current = performance.now() - playheadRef.current * 1000;
-    rafRef.current = requestAnimationFrame(tick);
+  const startPlayback = async () => {
+    if(exportInProgressRef.current||isPlayingRef.current||audioPreparing)return;
+    const active=previewContextRef.current.sequenceId;if(sequenceDuration(sequenceProjectRef.current.sequences[active])<=0)return;
+    const revision=++audioStartRevision.current;setAudioPreparing(true);canvasEditCancelRef.current?.();libraryPreviewRef.current=false;
+    try{await audioManager.resumeAudioContext();await prepareSequenceAudio(audioPreviewSequenceId,true);if(revision!==audioStartRevision.current||previewContextRef.current.sequenceId!==active)return;
+      if(previewRafRef.current!=null)cancelAnimationFrame(previewRafRef.current);previewRafRef.current=null;
+      const activeDuration=sequenceDuration(sequenceProjectRef.current.sequences[active]);if(playheadRef.current>=activeDuration)playheadRef.current=0;
+      playheadUiLastTsRef.current=null;isPlayingRef.current=true;setIsPlaying(true);startTsRef.current=performance.now()-playheadRef.current*1000;rafRef.current=requestAnimationFrame(tick);
+    }catch(error){setAnimationIssue(`播放准备失败：${String(error)}`);}finally{if(revision===audioStartRevision.current)setAudioPreparing(false);}
   };
 
   const stopPlayback = () => {
+    audioStartRevision.current++;setAudioPreparing(false);
     canvasEditCancelRef.current?.();
     if (previewRafRef.current != null) cancelAnimationFrame(previewRafRef.current);
     previewRafRef.current = null;
@@ -1667,12 +1725,16 @@ export default function Live2DView() {
     format: VideoExportFormat,
     mode: VideoExportMode,
     includeAudio: boolean,
+    method: VideoExportMethod,
   ) => {
     if (!canvasRef.current || !appRef.current) return;
     if (exportState === "exporting" || exportInProgressRef.current) return;
 
     const exportSequence = sequenceProjectRef.current.sequences[previewSequenceId];
-    const totalDuration = sequenceDuration(exportSequence);
+    const sequenceEnd=sequenceDuration(exportSequence);
+    const range=useMarkedExportRange&&markedExportRange?.sequenceId===previewSequenceId?markedExportRange:undefined;
+    const exportStart=range?Math.min(sequenceEnd,range.start):0;
+    const totalDuration=Math.max(0,(range?Math.min(sequenceEnd,range.end):sequenceEnd)-exportStart);
 
     if (totalDuration <= 0) {
       showAlert("时间线为空，无法导出");
@@ -1689,6 +1751,14 @@ export default function Live2DView() {
       showAlert(`有 ${blobOnlyAudio.length} 条临时音频无法导出，请重新导入音频文件`);
       return;
     }
+
+    // WebM 可以在支持 MediaRecorder 的环境里实时录制；MOV、透明背景与环境不支持时仍走逐帧 PNG → ffmpeg。
+    const pipeline = resolveExportPipeline({
+      format,
+      method,
+      transparentBg,
+      recordingSupported: getWebmRecordingSupport().supported,
+    });
 
     const baseName = mode === "subtitle-only" ? "subtitles-only" : mode === "live2d-only" ? "live2d-only" : "export";
     let selectedPath: string | null;
@@ -1719,6 +1789,8 @@ export default function Live2DView() {
     }
 
     exportInProgressRef.current = true;
+    setExportIssue("");retryExportRef.current=()=>void exportVideo(format,mode,includeAudio,method);
+    exportAbortRef.current=new AbortController();recordingCancelRef.current=false;
     setExportState('exporting');
     setExportTime(0);
     setExportProgress(0);
@@ -1760,6 +1832,138 @@ export default function Live2DView() {
       });
     };
 
+    /** 把当前舞台画面画到导出画布：有裁切框时走 2D 画布，否则直接渲染 PIXI 画布。 */
+    const paintExportFrame = () => {
+      if (exportCtx) {
+        if (transparentBg) {
+          exportCtx.clearRect(0, 0, exportCanvas.width, exportCanvas.height);
+        }
+        exportCtx.drawImage(
+          canvasRef.current!,
+          customRecordingBounds.x,
+          customRecordingBounds.y,
+          customRecordingBounds.width,
+          customRecordingBounds.height,
+          0,
+          0,
+          exportCanvas.width,
+          exportCanvas.height
+        );
+      } else {
+        app.renderer.render(app.stage);
+      }
+    };
+
+    /**
+     * 实时录制：按真实时间推进时间线并录制画布流，音频经 AudioManager 的录制通道混进同一个 WebM。
+     * 返回 "cancelled" 表示用户中途停止（不落盘）。
+     */
+    const runWebmRecording = async (): Promise<"saved" | "cancelled"> => {
+      const support = getWebmRecordingSupport();
+      if (!support.supported || !support.mimeType) {
+        throw new Error(`${support.reason ?? "当前环境不支持实时录制"}，请改用逐帧渲染。`);
+      }
+      if (includeAudio) {
+        await audioManager.resumeAudioContext();
+        if (!audioManager.recordingDestinationRef.current) {
+          throw new Error("音频录制通道不可用，请改用逐帧渲染。");
+        }
+      }
+      const recordingAudioSchedule = includeAudio
+        ? resolveAudioSchedule(sequenceProjectRef.current, previewSequenceId)
+        : [];
+      const recorder = createCanvasStreamRecorder({
+        canvas: exportCanvas,
+        fps: settings.fps,
+        mimeType: support.mimeType,
+        videoBitsPerSecond: estimateRecordingVideoBitrate(exportSequence.width, exportSequence.height, settings.fps),
+        audioStream: includeAudio ? audioManager.recordingDestinationRef.current?.stream ?? null : null,
+      });
+
+      if (!firstFrame) {
+        firstFrame = true;
+        if (prepInterval) { clearInterval(prepInterval); prepInterval = null; }
+      }
+      recordingCancelRef.current = false;
+      setExportPhase("record");
+      updateExportUi(0, 0, true);
+
+      try {
+        // 先把时间线推进到 0 并画一帧，避免录制开头录到上一次预览的残留画面。
+        await applyTimelineAtTime(exportStart, true, mode);
+        syncPlayheadUi(0, performance.now());
+        paintExportFrame();
+      } catch (error) {
+        recorder.cancel();
+        throw error;
+      }
+
+      recorder.start();
+      // 只改 ref：音频与嘴型需要「播放中」，但 React 播放状态会让空格键触发 stopPlayback 打断录制。
+      isPlayingRef.current = true;
+      const recordingStart = performance.now();
+      let renderedSteps = 0;
+      let loopError: unknown = null;
+
+      await new Promise<void>((resolve) => {
+        const step = async (ts: number) => {
+          const elapsed = (performance.now() - recordingStart) / 1000;
+          const time = Math.min(totalDuration, elapsed);
+          syncPlayheadUi(time, ts);
+          try {
+            await applyTimelineAtTime(exportStart+time, true, mode);
+          } catch (error) {
+            loopError = error;
+            resolve();
+            return;
+          }
+          renderedSteps += 1;
+          paintExportFrame();
+          if (includeAudio) {
+            audioManager.syncBufferAudio(recordingAudioSchedule.map(clip=>playbackAudioItem(clip,exportStart+time)),true);
+          }
+          updateExportUi(time, Math.min(95, (time / totalDuration) * 95));
+          if (recordingCancelRef.current || time >= totalDuration) {
+            resolve();
+            return;
+          }
+          recordingRafRef.current = requestAnimationFrame((next) => { void step(next); });
+        };
+        recordingRafRef.current = requestAnimationFrame((ts) => { void step(ts); });
+      });
+
+      if (recordingRafRef.current !== null) {
+        cancelAnimationFrame(recordingRafRef.current);
+        recordingRafRef.current = null;
+      }
+      if (loopError) {
+        recorder.cancel();
+        audioManager.stopAllAudio();
+        isPlayingRef.current = false;
+        throw loopError;
+      }
+      if (recordingCancelRef.current) {
+        recorder.cancel();
+        audioManager.stopAllAudio();
+        isPlayingRef.current = false;
+        return "cancelled";
+      }
+
+      const blob = await recorder.stop();
+      audioManager.stopAllAudio();
+      isPlayingRef.current = false;
+      if (blob.size === 0) {
+        throw new Error("实时录制没有捕获到画面数据，请改用逐帧渲染。");
+      }
+      await writeFile(outputPath, new Uint8Array(await blob.arrayBuffer()));
+
+      const expectedFrames = Math.max(1, Math.round(totalDuration * settings.fps));
+      if (renderedSteps < expectedFrames * 0.8) {
+        showAlert(`实时录制已保存，但渲染丢帧较多（约 ${renderedSteps}/${expectedFrames} 帧）。需要逐帧精确输出请改用「逐帧渲染」。`);
+      }
+      return "saved";
+    };
+
     try {
       prepInterval = window.setInterval(() => {
         if (firstFrame) return;
@@ -1771,12 +1975,15 @@ export default function Live2DView() {
       await prepareSequenceAudio(previewSequenceId, true);
       app.renderer.resize(exportSequence.width, exportSequence.height);
       const exportAudioSchedule = resolveAudioSchedule(sequenceProjectRef.current, previewSequenceId);
-      await runVideoExport({
+      const outcome: "saved" | "cancelled" = pipeline.kind === "record"
+        ? await runWebmRecording()
+        : await runVideoExport({
         canvas: exportCanvas,
         outputPath,
         format,
         fps: settings.fps,
         targetFrameCount: targetFrames,
+        startTime:exportStart,signal:exportAbortRef.current?.signal,onPhase:setExportPhase,
         applyTimelineAtTime: (timeSec) => applyTimelineAtTime(timeSec, true, mode),
         renderFrame: () => {
           app.renderer.render(app.stage);
@@ -1797,42 +2004,57 @@ export default function Live2DView() {
             );
           }
         },
-        audioTracks: exportAudioSchedule.map((clip) => {
+        audioTracks: sliceExportAudio(exportAudioSchedule.map((clip) => {
           const asset = sequenceProjectRef.current.assets[clip.assetId];
           const audioUrl = audioManager.audioRefs.current.get(clip.id)?.src;
           return {
             id: clip.id, start: clip.start, duration: clip.duration, sourceDuration: asset?.duration,
             sourceIn: clip.sourceIn, playbackRate: clip.rate, gain: clip.gain,
             fadeIn: clip.fadeIn, fadeOut: clip.fadeOut, muted: clip.muted,
-            gainEnvelopes: clip.gainEnvelopes,
+            gainEnvelopes: clip.gainEnvelopes,preservePitch:clip.preservePitch,
             audioUrl, audioPath: asset?.uri,
           };
-        }),
+        }),exportStart,exportStart+totalDuration),
         includeAudio,
         onProgress: ({ frameIndex, totalFrames, timeSec }) => {
           if (!firstFrame) {
             firstFrame = true;
             if (prepInterval) { clearInterval(prepInterval); prepInterval = null; }
           }
+          if (frameIndex >= totalFrames) setExportPhase("encode");
           updateExportUi(
             timeSec,
             Math.min(85, (frameIndex / totalFrames) * 85),
             frameIndex >= totalFrames,
           );
         }
-      });
+      }).then(() => "saved" as const);
+
+      if (outcome === "cancelled") {
+        setExportState('idle');
+        setExportTime(0);
+        setExportProgress(0);
+        return;
+      }
 
       setExportState('done');
       setExportTime(0);
       setExportProgress(0);
     } catch (error) {
+      if(exportAbortRef.current?.signal.aborted){setExportState("idle");return;}
       console.error('视频导出失败:', error);
-      showAlert("视频导出失败: " + String(error));
+      setExportIssue("导出失败：" + String(error));
       setExportState('idle');
       setExportTime(0);
       setExportProgress(0);
     } finally {
-      exportInProgressRef.current = false;
+      exportInProgressRef.current = false;exportAbortRef.current=null;
+      recordingCancelRef.current = false;
+      setExportPhase("render");
+      if (recordingRafRef.current !== null) {
+        cancelAnimationFrame(recordingRafRef.current);
+        recordingRafRef.current = null;
+      }
       restoreModelVisibility(previousModelVisibility);
       subtitleVisibilityOverrideRef.current = previousSubtitleOverride;
       renderSubtitleClip(null);
@@ -2153,6 +2375,8 @@ export default function Live2DView() {
     };
     return {
       ...base,
+      projectPath,
+      fileSignature: savedSignature,
       version: 3,
       document: currentDocument,
     };
@@ -2206,6 +2430,8 @@ export default function Live2DView() {
     setSequenceSelection({ sequenceId: restoredDocument.rootSequenceId, clipIds: [] });
     sceneRuntimeRef.current?.setProject(restoredDocument);
     setSequenceProject(restoredDocument);
+    setProjectPath(snapshot.projectPath);setSavedSignature(projectSignature(restoredDocument));
+    libraryPreviewRef.current=false;setSelectedProjectAssetId(undefined);
     const legacyAsset = restoredDocument.assets["asset:model:main"];
     pendingMigrationRef.current = snapshot.version === 1 ? { motions: snapshot.motionClips, expressions: snapshot.exprClips } : legacyAsset?.metadata?.legacyMotions ? { motions: JSON.parse(String(legacyAsset.metadata.legacyMotions)), expressions: JSON.parse(String(legacyAsset.metadata.legacyExpressions ?? "[]")) } : null;
     migrationFailedRef.current = false;
@@ -2248,6 +2474,7 @@ export default function Live2DView() {
         const snapshot = await loadAutosaveProject();
         if (snapshot && !cancelled) {
           await applyProjectSnapshot(snapshot);
+          setSavedSignature(snapshot.fileSignature ?? "");
           if (snapshot.savedAt) setLastAutosaveAt(new Date(snapshot.savedAt));
         }
       } catch (error) {
@@ -2263,13 +2490,15 @@ export default function Live2DView() {
     if (!projectHydrated) return;
     const snapshot = makeProjectSnapshot();
     const timer = window.setTimeout(() => {
-      void saveAutosaveProject(snapshot)
+      void saveAutosaveProject(snapshot).then(()=>saveRecovery(snapshot))
         .then(() => setLastAutosaveAt(new Date()))
-        .catch((error) => console.warn("自动保存工程失败", error));
+        .catch((error) => {setSaveIssue("自动保存失败："+String(error));console.warn("自动保存工程失败",error);});
     }, 900);
     return () => window.clearTimeout(timer);
   }, [
     projectHydrated,
+    projectPath,
+    savedSignature,
     animation,
     selectedModel,
     selectedCharacterId,
@@ -2292,27 +2521,40 @@ export default function Live2DView() {
     isPlaying,
   ]);
 
-  const saveWorkspaceProject = async () => {
+  const saveWorkspaceProject = async (asNew=false) => {
+    if(savingRef.current)return;savingRef.current=true;setSaveBusy(true);setSaveIssue("");
+    let temp:string|undefined;
     try {
-      const path = await save({
-        title: "保存 Live2D 工程",
-        defaultPath: "Live2D 工程.l2dproject",
-        filters: [{ name: "Live2D 工程", extensions: ["l2dproject"] }],
-      });
-      if (!path) return;
-      await writeFile(path, await createProjectBundle(makeProjectSnapshot(), modelRoot ?? undefined));
-      showAlert("工程已保存，包含模型、音频和图片素材。");
-    } catch (error) {
-      showAlert(`保存工程失败：${error instanceof Error ? error.message : String(error)}`);
-    }
+      let path=(!asNew&&projectPath)||await save({title:asNew?"工程另存为":"保存 Live2D 工程",defaultPath:projectPath??`${sequenceProjectRef.current.name}.l2dproject`,filters:[{name:"Live2D 工程",extensions:["l2dproject"]}]});
+      if(!path)return;
+      try { temp=await invoke<string>("allow_project_write",{path,nonce:crypto.randomUUID()}); }
+      catch(error) {
+        if(!String(error).includes("请先在保存对话框"))throw error;
+        path=await save({title:"重新授权工程保存位置",defaultPath:path,filters:[{name:"Live2D 工程",extensions:["l2dproject"]}]});
+        if(!path)return;
+        temp=await invoke<string>("allow_project_write",{path,nonce:crypto.randomUUID()});
+      }
+      const snapshot=makeProjectSnapshot();
+      const bytes=await createProjectBundle(snapshot,modelRoot??undefined);
+      await writeFile(temp,bytes);
+      if(await exists(path))await copyFile(path,`${path}.bak`);
+      await rename(temp,path);temp=undefined;
+      setProjectPath(path);setSavedSignature(projectSignature(snapshot.document!));
+      await saveAutosaveProject({...snapshot,projectPath:path,fileSignature:projectSignature(snapshot.document!)});await saveRecovery({...snapshot,projectPath:path,fileSignature:projectSignature(snapshot.document!)});
+    } catch(error){setSaveIssue(`保存失败：${String(error)}`);}
+    finally{if(temp)try{await remove(temp);}catch{/* Best effort temporary cleanup. */}savingRef.current=false;setSaveBusy(false);}
   };
+  const workspaceSaveRef=useRef(saveWorkspaceProject);workspaceSaveRef.current=saveWorkspaceProject;
+  useEffect(()=>{const key=(event:KeyboardEvent)=>{if((event.metaKey||event.ctrlKey)&&event.code==="KeyS"){event.preventDefault();void workspaceSaveRef.current(event.shiftKey);}};window.addEventListener("keydown",key);return()=>window.removeEventListener("keydown",key);},[]);
 
-  const newWorkspaceProject = () => {
+  const newWorkspaceProject = async () => {
+    await saveRecovery(makeProjectSnapshot());
     canvasEditCancelRef.current?.();
     stopPlayback();
     endProjectEdit();
     const project = migrateLegacyProject({ selectedModel: null, motionClips: [], exprClips: [], audioClips: [], subtitleClips: [], playhead: 0 });
     project.id = crypto.randomUUID(); project.name = "新工程";
+    setProjectPath(undefined);setSavedSignature("");
     changeSequenceProject(project);
     setNavigationResetKey((key) => key + 1);
     pendingMigrationRef.current = null;
@@ -2330,7 +2572,9 @@ export default function Live2DView() {
         filters: [{ name: "Live2D 工程", extensions: ["l2dproject"] }],
       });
       if (typeof path !== "string") return;
+      await saveRecovery(makeProjectSnapshot());
       const snapshot = await openProjectBundle(path, modelRoot ?? undefined);
+      snapshot.projectPath=path;
       if (modelRoot && snapshot.document) await refreshModels();
       await applyProjectSnapshot(snapshot);
       await saveAutosaveProject(snapshot);
@@ -2520,7 +2764,7 @@ export default function Live2DView() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // ????????????????
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+      if (e.defaultPrevented || e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement || e.target instanceof HTMLButtonElement) {
         return;
       }
       
@@ -2617,9 +2861,7 @@ export default function Live2DView() {
       const item = sequence.tracks.flatMap((track) => track.clips.map((clip) => ({ track, clip }))).find(({ clip }) => selected.clipIds.includes(clip.id));
       if (!item || item.track.locked) return;
       const sourceTime = Math.max(0, item.clip.sourceIn + (previewContextRef.current.time - item.clip.start) * item.clip.rate);
-      const current = evaluateClipTransform(item.clip, sourceTime);
-      const existing = item.clip.transformKeys.find((key) => Math.abs(key.time - sourceTime) < 1e-6);
-      const patch = item.clip.transformKeys.length ? { transformKeys: existing ? item.clip.transformKeys.map((key) => key.id === existing.id ? { ...key, ...value } : key) : [...item.clip.transformKeys, { ...current, ...value, id: crypto.randomUUID(), time: sourceTime }].sort((a, b) => a.time - b.time) } : { transform: { ...item.clip.transform, ...value } };
+      const patch=editPropertiesAt(item.clip,sourceTime,value);
       changeSequenceProject(updateClip(project, sequence.id, item.track.id, item.clip.id, patch, sequence.fps));
     };
     const wheel = (event: WheelEvent) => {
@@ -2750,7 +2992,7 @@ export default function Live2DView() {
     selectedModel,
     onSelectModel: (rel: string | null) => {
       libraryPreviewRef.current = true;
-      setSelectedProjectAssetId(undefined);
+      if(rel){const current=sequenceProjectRef.current;const found=Object.values(current.assets).find(asset=>asset.kind==="live2d"&&asset.uri===rel);const asset=found??{id:`asset:model:${crypto.randomUUID()}`,kind:"live2d" as const,name:rel.split("/").pop()??rel,uri:rel,duration:5};if(!found)changeSequenceProject({...current,assets:{...current.assets,[asset.id]:asset}});setSelectedProjectAssetId(asset.id);}else setSelectedProjectAssetId(undefined);
       sceneRuntimeRef.current?.setVisible(false);
       setExternalModelDisplayName(null);
       externalModelPathRef.current = null;
@@ -2764,7 +3006,7 @@ export default function Live2DView() {
     onImportModel: () => void importModel(false),
     onImportModelFolder: () => void importModel(true),
     onDeleteModelPackage: (id: string) => void deleteModelPackage(id),
-    projectAssets: Object.values(sequenceProject.assets).filter((asset) => (asset.kind !== "live2d" || asset.missing) && ((asset.kind !== "motion" && asset.kind !== "expression") || asset.metadata?.sourceModel !== materialModelOrigin())),
+    projectAssets: Object.values(sequenceProject.assets).filter((asset) => asset.kind !== "live2d" || asset.missing),
     getMaterialSource,
     selectedProjectAssetId,
     projectAssetThumbnails,
@@ -2832,11 +3074,16 @@ export default function Live2DView() {
     transparentBg,
     setTransparentBg,
     exportState,
+    exportPhase,
     exportTime,
     exportProgress,
-    onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => {
-      void exportVideo(format, mode, includeAudio);
+    onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean, method: VideoExportMethod) => {
+      void exportVideo(format, mode, includeAudio, method);
     },
+    onCancelExport: () => { recordingCancelRef.current = true;exportAbortRef.current?.abort(); },
+    exportRangeAvailable:markedExportRange?.sequenceId===previewSequenceId,
+    useMarkedExportRange,setUseMarkedExportRange,
+    estimatedStorageBytes:estimateFrameStorage(sequenceProject.sequences[previewSequenceId]?.width??1920,sequenceProject.sequences[previewSequenceId]?.height??1080,Math.ceil((useMarkedExportRange&&markedExportRange?.sequenceId===previewSequenceId?markedExportRange.end-markedExportRange.start:sequenceDuration(sequenceProject.sequences[previewSequenceId]))*(sequenceProject.sequences[previewSequenceId]?.fps??30))),
     onExportSubtitlesSrt: exportSubtitlesSrt,
     onTakeScreenshot: () => screenshotManager.takeScreenshot(),
     onTakePartsScreenshots: () => screenshotManager.takePartsScreenshots(),
@@ -2844,10 +3091,10 @@ export default function Live2DView() {
 
   return (
     <div className="editor-shell">
-      <header className="editor-topbar" inert={exportState === "exporting"}>
+      {showRecovery&&<RecoveryDialog projectId={sequenceProject.id} onClose={()=>setShowRecovery(false)} onRestore={async snapshot=>{await saveRecovery(makeProjectSnapshot());await applyProjectSnapshot(snapshot);setSavedSignature("");}}/>}
+      <header className="editor-topbar" inert={exportState === "exporting" || saveBusy}>
         <div className="editor-topbar-brand">
-          <div className="editor-topbar-kicker">像素工坊 · LIVE2D MOVIE MAKER</div>
-          <h1>Live2D 工作台</h1>
+          <h1>{sequenceProject.name}{savedSignature!==projectSignature(sequenceProject)?" · 未保存":""}</h1><span className="pane-note" role="status">{saveBusy?"保存中…":saveIssue|| (projectPath?"已关联工程文件":"自动恢复已启用")}</span>
         </div>
 
         <div className="editor-topbar-main">
@@ -2865,24 +3112,24 @@ export default function Live2DView() {
               {selectedModel && !modelList.includes(selectedModel) && <option value={selectedModel}>{selectedModel.split('/').pop()}</option>}
               {modelList.map((rel) => (
                 <option key={rel} value={rel}>
-                  {rel}
+                  {rel.split("/").pop()?.replace(/\.model3?\.json$/i,"")}
                 </option>
               ))}
             </select>
           </div>
 
           <div className="topbar-button-group">
-            <button className="btn btn--quiet" onClick={newWorkspaceProject}>新建</button>
+            <button className="btn btn--quiet" onClick={()=>void newWorkspaceProject()}>新建</button>
             <button className="btn btn--quiet" onClick={() => void openWorkspaceProject()}>打开</button>
-            <button className="btn btn--quiet" onClick={() => void saveWorkspaceProject()}>保存</button>
+            <button className="btn btn--quiet" disabled={saveBusy} onClick={() => void saveWorkspaceProject()}>保存</button><button className="btn btn--quiet" disabled={saveBusy} onClick={()=>void saveWorkspaceProject(true)}>另存为</button><button className="btn btn--quiet" onClick={()=>setShowRecovery(true)}>恢复</button><button className="btn btn--accent" onClick={()=>setActiveInspectorTab("export")}>导出</button>
             <button className="btn btn--quiet" onClick={refreshModels}>
               刷新
             </button>
             <button className="btn btn--accent" onClick={() => void importModel(false)} disabled={isImportingModel}>
               {isImportingModel ? "导入中…" : "＋ 导入模型"}
             </button>
-            <button className={`btn ${isPlaying ? "btn--accent" : "btn--primary"}`} onClick={isPlaying ? stopPlayback : startPlayback} disabled={!timelineLength && !isPlaying}>
-              {isPlaying ? "停止播放" : "开始播放"}
+            <button className={`btn ${isPlaying ? "btn--accent" : "btn--primary"}`} onClick={isPlaying||audioPreparing?stopPlayback:()=>void startPlayback()} disabled={!timelineLength && !isPlaying}>
+              {audioPreparing?"准备声音…":isPlaying?"暂停":"播放"}
             </button>
             <button className="btn btn--quiet" onClick={importProjectAudioAsset}>
               导入音频素材
@@ -2946,17 +3193,17 @@ export default function Live2DView() {
               ) : null}
 
               <div className="monitor-overlay monitor-overlay--top">
+                <select aria-label="预览质量" className="input" value={previewQuality} onChange={event=>setPreviewQuality(Number(event.target.value))}><option value="1">完整</option><option value="0.5">1/2</option><option value="0.25">1/4</option></select>
+                {showPreviewInfo&&<><select aria-label="预览缓存预算" className="input" value={cacheBudget} onChange={event=>setCacheBudget(Number(event.target.value))}><option value="128">128 MiB</option><option value="256">256 MiB</option><option value="512">512 MiB</option></select><button className="btn btn--quiet" onClick={()=>{sceneRuntimeRef.current?.clearCache();void applyTimelineAtTime(previewContextRef.current.time);}}>清除缓存</button></>}
                 <span>{selectedProjectAssetId && libraryPreviewRef.current ? sequenceProject.assets[selectedProjectAssetId]?.name : sequenceProject.sequences[previewSequenceId]?.name}</span>
               </div>
-              {libraryPreviewRef.current && selectedProjectAssetId && sequenceProject.assets[selectedProjectAssetId]?.kind === "audio" && projectAssetThumbnails[selectedProjectAssetId] && <audio key={selectedProjectAssetId} controls src={projectAssetThumbnails[selectedProjectAssetId]} style={{ position: "absolute", left: "10%", top: "45%", width: "80%" }} />}
 
-              <div className="monitor-overlay monitor-overlay--bottom">
-                <span>FPS {currentFps.toFixed(1)}</span>
-                <span>{previewSequenceTime.toFixed(2)} 秒</span>
-                <span>{enableDragging ? "允许拖拽" : "拖拽关闭"}</span>
-              </div>
+
+              {enableDragging&&<div className="monitor-overlay monitor-overlay--bottom"><button className="btn btn--quiet" title="显示帧率" onClick={()=>setShowPreviewInfo(value=>!value)}>信息</button>{showPreviewInfo&&<span>{currentFps.toFixed(1)} fps · {previewSequenceTime.toFixed(2)} 秒</span>}</div>}
             </div>
           </section>
+          <AudioMeter read={audioManager.readOutputLevel}/>
+          {libraryPreviewRef.current&&selectedProjectAssetId&&sequenceProject.assets[selectedProjectAssetId]&&!['motion','expression'].includes(sequenceProject.assets[selectedProjectAssetId].kind)&&<SourceMonitor key={selectedProjectAssetId} project={sequenceProject} asset={sequenceProject.assets[selectedProjectAssetId]} onAudioPlay={(time,playing)=>playSourceAudio(sequenceProject.assets[selectedProjectAssetId],time,playing)} onSeek={time=>{if(sequenceProject.assets[selectedProjectAssetId].kind!=="audio")void seekSourceAsset(sequenceProject.assets[selectedProjectAssetId],time);}} onBegin={beginProjectEdit} onEnd={endProjectEdit} onRange={(start,end)=>changeSourceRange(sequenceProject.assets[selectedProjectAssetId],start,end)} onClose={closeSourcePreview} onAdd={()=>{setAssetInsertRequest({assetId:selectedProjectAssetId,serial:Date.now()});closeSourcePreview();}}/>}
         </main>
 
         <div
@@ -2976,9 +3223,10 @@ export default function Live2DView() {
           <div className="inspector-tabs" role="tablist" aria-label="检查器分页" inert={exportState === "exporting"}>
             {([['character', '检查器'], ['export', '导出'], ['project', '工程']] as const).map(([tab, label]) => <button key={tab} role="tab" aria-selected={activeInspectorTab === tab} className={`inspector-tab${activeInspectorTab === tab ? ' is-active' : ''}`} onClick={() => setActiveInspectorTab(tab)}>{label}</button>)}
           </div>
-          {activeInspectorTab === "character" ? <SequenceInspector project={sequenceProject} onProjectChange={changeSequenceProject}
-            selection={sequenceSelection} time={previewSequenceTime}
+          {activeInspectorTab === "character" && libraryPreviewRef.current&&selectedProjectAssetId&&sequenceProject.assets[selectedProjectAssetId]?<section className="workspace-section"><header className="workspace-section-header"><h3 className="workspace-section-title">素材</h3></header><div className="workspace-section-body"><label className="field-stack"><span>名称</span><input className="input" value={sequenceProject.assets[selectedProjectAssetId].name} onFocus={beginProjectEdit} onBlur={endProjectEdit} onChange={event=>{const current=sequenceProjectRef.current;changeSequenceProject({...current,assets:{...current.assets,[selectedProjectAssetId]:{...current.assets[selectedProjectAssetId],name:event.target.value}}});}}/></label>{sequenceProject.assets[selectedProjectAssetId].missing&&<button className="btn btn--accent" onClick={()=>void repairProjectAsset(selectedProjectAssetId)}>重新链接</button>}<button className="btn btn--quiet" onClick={()=>{setAssetInsertRequest({assetId:selectedProjectAssetId,serial:Date.now()});closeSourcePreview();}}>加入时间线</button></div></section>:activeInspectorTab === "character" ? <SequenceInspector project={sequenceProject} onProjectChange={changeSequenceProject}
+            selection={sequenceSelection} time={previewSequenceTime} linkedSelection={linkedClipSelection}
             onBeginEdit={() => { stopPlayback(); beginProjectEdit(); }} onEndEdit={endProjectEdit} /> : <>
+              {activeInspectorTab === "export"&&exportIssue&&<div className="seq-tl-issue" role="alert"><span>{exportIssue}</span><button onClick={()=>retryExportRef.current?.()}>重试</button><button aria-label="关闭导出错误" onClick={()=>setExportIssue("")}>×</button></div>}
               {activeInspectorTab === "export" && <div className="pane-note">{sequenceProject.sequences[previewSequenceId]?.name} · {sequenceProject.sequences[previewSequenceId]?.width}×{sequenceProject.sequences[previewSequenceId]?.height} · {sequenceProject.sequences[previewSequenceId]?.fps} fps</div>}
               <ControlPanel {...panelProps} mode="inspector" activeInspectorTab={activeInspectorTab} hideInspectorTabs inspectorTabs={["export", "project"]} />
             </>}
@@ -3004,6 +3252,9 @@ export default function Live2DView() {
         }}>重试加载</button><button className="btn btn--quiet" onClick={() => void importModel(false)}>补充模型</button></div>}
         <Timeline
           project={sequenceProject}
+          assetInsertRequest={assetInsertRequest}
+          onRangeChange={(sequenceId,range)=>setMarkedExportRange(range?{sequenceId,...range}:undefined)}
+          onTrackSelect={(sequenceId,trackId)=>{closeSourcePreview();setSequenceSelection({sequenceId,clipIds:[],trackId});}}
           navigationResetKey={navigationResetKey}
           onProjectChange={changeSequenceProject}
           onUndoProject={undoSequenceProject}
@@ -3012,6 +3263,8 @@ export default function Live2DView() {
           onEndProjectEdit={endProjectEdit}
           onSelectionChange={(sequenceId, clipIds) => { setSequenceSelection({ sequenceId, clipIds }); if (clipIds.length) { libraryPreviewRef.current = false; void applyTimelineAtTime(previewContextRef.current.time); } }}
           externalSelection={sequenceSelection}
+          linkedSelection={linkedClipSelection}
+          onLinkedSelectionChange={setLinkedClipSelection}
           previewSequenceId={previewSequenceId}
           previewSequenceTime={previewSequenceTime}
           showInlineInspector={false}

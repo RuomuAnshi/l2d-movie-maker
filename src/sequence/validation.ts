@@ -50,6 +50,21 @@ export function isProjectDocument(value: unknown): value is ProjectDocument {
     if (clip.textColor != null && typeof clip.textColor !== "string") return false;
     if (clip.fontSize != null && (!Number.isFinite(clip.fontSize) || clip.fontSize <= 0)) return false;
     if (clip.lipSyncActorId != null && typeof clip.lipSyncActorId !== "string") return false;
+    if (clip.lipSyncOffset != null && !Number.isFinite(clip.lipSyncOffset)) return false;
+    if (clip.preservePitch != null && typeof clip.preservePitch !== "boolean") return false;
+    if (clip.propertyCurves != null) {
+      if (!record(clip.propertyCurves)) return false;
+      for (const [name, curve] of Object.entries(clip.propertyCurves)) {
+        if (!["x","y","scaleX","scaleY","rotation","opacity","volume"].includes(name) || !curve || typeof curve.enabled !== "boolean" || !Array.isArray(curve.keys)) return false;
+        const ids = new Set<string>();
+        for (const key of curve.keys) {
+          if (!key || typeof key.id !== "string" || !key.id || ids.has(key.id) || !finite([key.time,key.value]) || key.time < 0 || !["linear","hold","inverse-hold","bezier"].includes(key.interpolation) || (key.inHandle && !finite([key.inHandle.time,key.inHandle.value])) || (key.outHandle && !finite([key.outHandle.time,key.outHandle.value]))) return false;
+          ids.add(key.id);
+        }
+        if (curve.keys.some((key,index)=>index>0&&curve.keys[index-1].time>key.time)) return false;
+      }
+    }
+    if (clip.linkGroupId != null && (typeof clip.linkGroupId !== "string" || !clip.linkGroupId)) return false;
     if (clip.fadeRegion && (!finite([clip.fadeRegion.sourceIn, clip.fadeRegion.sourceDuration, clip.fadeRegion.rate]) || clip.fadeRegion.sourceIn < 0 || clip.fadeRegion.sourceDuration <= 0 || clip.fadeRegion.rate <= 0)) return false;
     const transformIds = new Set<string>(), volumeIds = new Set<string>();
     for (const key of clip.transformKeys) {

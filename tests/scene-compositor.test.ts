@@ -318,3 +318,30 @@ test("SceneRuntime renders migrated speaker labels and responds to the speaker d
     assert.equal(project.sequences.root.tracks[0].clips[0].text, "正文");
   } finally { runtime.destroy(); }
 });
+
+test("preview quality changes texture cost without changing transforms or model evaluation; offline stays full resolution", async () => {
+  resetSceneMocks();
+  const project=fixture();project.sequences.live=live();
+  project.sequences.root.tracks[0].clips=[createClip({id:"clip",kind:"sequence",sequenceId:"live",name:"live",start:0,duration:6})];
+  const {app}=makeApp();const runtime=new SceneRuntime(app as any,project,callbacks);
+  try {
+    await runtime.seekSceneAt("root",2);
+    const full=runtime.cacheStats().bytes;
+    runtime.setPreviewQuality(0.5);await runtime.seekSceneAt("root",2);
+    assert.equal(runtime.cacheStats().bytes,full/4);near(loadedModels[0].internalModel.coreModel.parameters.values[0],20);
+    await runtime.seekSceneAt("root",2,{offline:true});assert.equal(runtime.cacheStats().bytes,full);
+    runtime.clearCache();assert.deepEqual(runtime.cacheStats(),{instances:0,bytes:0});
+    await runtime.seekSceneAt("root",2);near(loadedModels.at(-1)!.internalModel.coreModel.parameters.values[0],20);
+  } finally {runtime.destroy();}
+});
+
+test("preview cache evicts old instance paths under its budget and rebuilds them deterministically", async () => {
+  resetSceneMocks();const project=fixture();project.sequences.live=live();
+  project.sequences.root.tracks[0].clips=Array.from({length:6},(_,i)=>createClip({id:`clip-${i}`,kind:"sequence",sequenceId:"live",name:"live",start:i*6,duration:6}));
+  const {app}=makeApp();const runtime=new SceneRuntime(app as any,project,callbacks);runtime.setCacheBudget(32);
+  try {
+    for(let i=0;i<6;i++)await runtime.seekSceneAt("root",i*6+2);
+    assert.ok(runtime.cacheStats().bytes<=32*1024*1024);assert.ok(loadedModels[0].destroyed);
+    await runtime.seekSceneAt("root",2);near(loadedModels.at(-1)!.internalModel.coreModel.parameters.values[0],20);
+  } finally {runtime.destroy();}
+});

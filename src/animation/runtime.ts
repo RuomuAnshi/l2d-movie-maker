@@ -356,11 +356,13 @@ export class TimelineRenderer {
     for (let frame = cached + 1; frame <= whole; frame++) {
       const t = frame * step;
       this.adapters.forEach((a) => a.step(document, t, step, lipAt(t)));
-      if (frame % 120 === 0)
+      if (frame % 120 === 0) {
         this.snapshots.set(
           frame,
           this.adapters.map((a) => a.snapshot()),
         );
+        if(this.snapshots.size>121){const oldest=[...this.snapshots.keys()].filter(key=>key!==0).sort((a,b)=>a-b)[0];this.snapshots.delete(oldest);}
+      }
     }
 
     this.liveFrame = whole;

@@ -26,6 +26,8 @@ type SequenceRuntime = {
   actors: Map<string, ActorRuntime>;
   visuals: Map<string, PIXI.Sprite | PIXI.Text>;
   disposed: boolean;
+  resolution: number;
+  lastUsed: number;
 };
 type RuntimeCallbacks = {
   resolveAssetUrl: (asset: ProjectAsset) => Promise<string>;
@@ -50,6 +52,10 @@ export class SceneRuntime {
   private thumbnailAssets = new Set<string>();
   private revision = 0;
   private disposed = false;
+  private previewResolution = 1;
+  private activeResolution = 1;
+  private cacheBudgetBytes = 256 * 1024 * 1024;
+  private touched = new Set<string>();
   private sprite = new PIXI.Sprite(PIXI.Texture.EMPTY);
   private latest: { sequenceId: string; time: number; options: SceneSeekOptions } | null = null;
   private normalized = new WeakMap<AnimationDocument, Map<string, AnimationDocument>>();
@@ -95,6 +101,20 @@ export class SceneRuntime {
   }
 
   setVisible(visible: boolean) { this.sprite.visible = visible; }
+  setPreviewQuality(resolution:number){this.previewResolution=[1,0.5,0.25].includes(resolution)?resolution:1;}
+  setCacheBudget(megabytes:number){this.cacheBudgetBytes=Math.max(32,Math.min(2048,megabytes))*1024*1024;}
+  cacheStats(){return {instances:this.sequences.size,bytes:[...this.sequences.values()].reduce((sum,item)=>sum+item.texture.width*item.texture.height*4*item.resolution**2,0)};}
+  clearCache(){this.revision++;for(const runtime of this.sequences.values())this.disposeSequence(runtime);this.sequences.clear();this.sprite.texture=PIXI.Texture.EMPTY;}
+  private trimCache(){
+    const bytes=()=>this.cacheStats().bytes;
+    for(const [key,runtime] of [...this.sequences].sort((a,b)=>a[1].lastUsed-b[1].lastUsed)){
+      if(bytes()<=this.cacheBudgetBytes)break;
+      if(this.touched.has(key)||this.actorLoads.size)continue;
+      this.disposeSequence(runtime);this.sequences.delete(key);
+    }
+    const usedImages=new Set([...this.sequences.values()].flatMap(runtime=>[...runtime.visuals.values()].map(display=>display instanceof PIXI.Sprite?display.texture:null)));
+    for(const [uri,texture] of this.imageTextures)if(!usedImages.has(texture)&&![...Object.values(this.project.assets)].some(asset=>asset.uri===uri)){texture.destroy(true);this.imageTextures.delete(uri);this.imageLoads.delete(uri);}
+  }
 
   private key(path: string[]) { return JSON.stringify(path); }
   private getSequence(sequence: Sequence, path: string[]): SequenceRuntime {
@@ -108,11 +128,14 @@ export class SceneRuntime {
     if (!runtime) {
       runtime = {
         sequenceId: sequence.id, path, container: new PIXI.Container(),
-        texture: PIXI.RenderTexture.create({ width: sequence.width, height: sequence.height, resolution: 1 }),
+        texture: PIXI.RenderTexture.create({ width: sequence.width, height: sequence.height, resolution: this.activeResolution }),
         actors: new Map(), visuals: new Map(), disposed: false,
+        resolution:this.activeResolution,lastUsed:performance.now(),
       };
       this.sequences.set(key, runtime);
     }
+    if(runtime.resolution!==this.activeResolution){runtime.texture.destroy(true);runtime.texture=PIXI.RenderTexture.create({width:sequence.width,height:sequence.height,resolution:this.activeResolution});runtime.resolution=this.activeResolution;}
+    runtime.lastUsed=performance.now();this.touched.add(key);
     return runtime;
   }
 
@@ -231,7 +254,7 @@ export class SceneRuntime {
     const remap = (curves: Record<string, import("../animation/types").Keyframe[]>) => Object.fromEntries(Object.entries(curves).map(([id, keys]) => [mapping.get(id) ?? id, keys]));
     const result = {
       ...sequence.animation, tracks: [...tracks, ...missing],
-      groups: sequence.animation.groups.map((group) => ({ ...group, curves: remap(group.curves), originalCurves: group.originalCurves ? remap(group.originalCurves) : undefined })),
+      groups: sequence.animation.groups.map((group) => ({ ...group, targetMask:group.targetMask?.map(target=>mapping.get(target)??target), curves: remap(group.curves), originalCurves: group.originalCurves ? remap(group.originalCurves) : undefined })),
     };
     if (!cache) { cache = new Map(); this.normalized.set(sequence.animation, cache); }
     cache.set(signature, result);
@@ -360,6 +383,7 @@ export class SceneRuntime {
   }
 
   async seekSceneAt(sequenceId: string, time: number, options: SceneSeekOptions = {}): Promise<void> {
+    this.activeResolution=options.offline?1:this.previewResolution;this.touched.clear();
     const revision = ++this.revision;
     this.latest = { sequenceId, time, options };
     const preview: PreviewPreparation | undefined = options.offline ? undefined : { issues: new Set(), unavailableClips: new Set(), unavailableActors: new Set() };
@@ -373,6 +397,7 @@ export class SceneRuntime {
     this.sprite.scale.set(scale);
     this.sprite.visible = true;
     this.app.renderer.render(this.app.stage);
+    if(!options.offline)this.trimCache();
     if (preview) {
       const issue = [...preview.issues].join("\n");
       if (issue && issue !== this.lastPreviewIssue) this.callbacks.onError?.(issue);

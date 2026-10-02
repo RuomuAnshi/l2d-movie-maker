@@ -8,9 +8,9 @@ import { emptyAnimation, targetId } from "../src/animation/types";
 import { createClip, createEditSequence, DEFAULT_TRANSFORM } from "../src/sequence/types";
 import type { ProjectDocument } from "../src/sequence/types";
 import { materialSourceFromAsset, materialSourceToAsset } from "../src/sequence/materials";
-import { createProjectBundle, modelResourceReferences, normalizeResourcePath, openProjectBundle, saveAutosaveProject } from "../src/utils/projectStorage";
+import { createProjectBundle, modelResourceReferences, normalizeResourcePath, openProjectBundle, saveAutosaveProject, storeAudioAsset, storeImageAsset } from "../src/utils/projectStorage";
 import type { ProjectSnapshot } from "../src/utils/projectStorage";
-import { buildAudioManifest } from "../src/utils/videoExporter";
+import { buildAudioManifest, resolveExportPipeline } from "../src/utils/videoExporter";
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "l2d-storage-test-"));
@@ -231,4 +231,35 @@ test("audio manifest preserves nested subframe schedule, rates and gain envelope
   assert.throws(() => buildAudioManifest([{ id: "missing", start: 0, duration: 1, audioUrl: "blob:runtime-only" }], 30), /缺少可读取/);
   assert.deepEqual(modelResourceReferences({ model: "a.moc", textures: ["a.png"], motions: { Idle: [{ file: "a.mtn" }] } }), ["a.moc", "a.png", "a.mtn"]);
   assert.equal(normalizeResourcePath("/models/aggregate/../parts/model.json"), "/models/parts/model.json");
+});
+
+test("export pipeline keeps real-time WebM recording only when it can preserve the output", () => {
+  assert.deepEqual(resolveExportPipeline({ format: "webm", method: "record", transparentBg: false, recordingSupported: true }), {
+    kind: "record", format: "webm", note: null,
+  });
+  assert.deepEqual(resolveExportPipeline({ format: "webm", method: "record", transparentBg: false, recordingSupported: false }), {
+    kind: "frames", format: "webm", note: "当前环境不支持 WebM 实时录制，已改用逐帧渲染（PNG → WebM）。",
+  });
+  assert.deepEqual(resolveExportPipeline({ format: "webm", method: "record", transparentBg: true, recordingSupported: true }), {
+    kind: "frames", format: "webm", note: "透明背景需要逐帧渲染（PNG → WebM），已改用逐帧渲染。",
+  });
+  assert.deepEqual(resolveExportPipeline({ format: "mov", method: "record", transparentBg: false, recordingSupported: true }), {
+    kind: "frames", format: "mov", note: "MOV 需要逐帧渲染才能保留 ProRes 4444 与透明通道，已改用逐帧渲染。",
+  });
+  assert.deepEqual(resolveExportPipeline({ format: "mov", method: "frames", transparentBg: false, recordingSupported: true }), {
+    kind: "frames", format: "mov", note: null,
+  });
+  assert.deepEqual(resolveExportPipeline({ format: "webm", method: "frames", transparentBg: true, recordingSupported: false }), {
+    kind: "frames", format: "webm", note: null,
+  });
+});
+
+test("native extension semantics preserve imported and restored media suffixes", async () => {
+  const f=await fixture();
+  try {
+    const sound=join(f.root,"tone.wav"),picture=join(f.root,"picture.png");
+    await writeFile(sound,"sound");await writeFile(picture,"image");
+    assert.match(await storeAudioAsset(sound),/\.wav$/);
+    assert.match(await storeImageAsset(picture),/\.png$/);
+  } finally {await rm(f.root,{recursive:true,force:true});}
 });

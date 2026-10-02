@@ -10,6 +10,22 @@ use tauri::Window;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::FsExt;
 
+/// A save dialog grants only its selected file. Allow precisely its atomic-save siblings.
+#[tauri::command]
+pub fn allow_project_write(window: tauri::Window, path: String, nonce: String) -> Result<String, String> {
+    let file = std::path::PathBuf::from(&path);
+    if file.extension().and_then(|value| value.to_str()) != Some("l2dproject")
+        || nonce.len() != 36 || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-') {
+        return Err("工程保存路径无效。".into());
+    }
+    let scope = window.fs_scope();
+    if !scope.is_allowed(&file) { return Err("请先在保存对话框选择工程文件。".into()); }
+    let temporary = format!("{path}.{nonce}.tmp");
+    scope.allow_file(&temporary).map_err(|error| error.to_string())?;
+    scope.allow_file(format!("{path}.bak")).map_err(|error| error.to_string())?;
+    Ok(temporary)
+}
+
 /// 由原生对话框选择模型资源，并仅授权本次选中的文件或目录供前端导入。
 #[tauri::command]
 pub async fn pick_model_source(window: Window, directory: bool) -> Result<Option<String>, String> {

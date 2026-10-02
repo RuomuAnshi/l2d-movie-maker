@@ -11,6 +11,8 @@ export type StoredClip = Omit<Clip, "audioBuffer" | "audioUrl">;
 export type StoredSubtitleClip = Omit<SubtitleClip, "audioBuffer" | "audioUrl">;
 
 export type ProjectSnapshot = {
+  projectPath?: string;
+  fileSignature?: string;
   version: 1 | 2 | 3;
   document?: ProjectDocument;
   animation?: AnimationDocument;
@@ -250,7 +252,7 @@ async function checkRestoredModelResources(primaryPath: string, packageRoot: str
 export async function storeAudioAsset(sourcePath: string) {
   const audioRoot = await join(await appDataDir(), "projects", "autosave", "audio");
   await mkdir(audioRoot, { recursive: true });
-  const extension = await extname(sourcePath);
+  const extension = mediaExtension(await extname(sourcePath));
   const managedPath = await join(audioRoot, `${crypto.randomUUID()}${extension}`);
   await copyFile(sourcePath, managedPath);
   return managedPath;
@@ -259,7 +261,7 @@ export async function storeAudioAsset(sourcePath: string) {
 export async function storeImageAsset(sourcePath: string) {
   const imageRoot = await join(await appDataDir(), "projects", "autosave", "images");
   await mkdir(imageRoot, { recursive: true });
-  const extension = await extname(sourcePath);
+  const extension = mediaExtension(await extname(sourcePath));
   const managedPath = await join(imageRoot, `${crypto.randomUUID()}${extension || ".img"}`);
   await copyFile(sourcePath, managedPath);
   return managedPath;
@@ -276,10 +278,16 @@ export async function storeImageBytes(bytes: Uint8Array, extension: string) {
 async function storeAssetBytes(bytes: Uint8Array, extension: string, kind: "audio" | "image") {
   const assetRoot = await join(await appDataDir(), "projects", "autosave", kind === "audio" ? "audio" : "images");
   await mkdir(assetRoot, { recursive: true });
-  const safeExtension = /^\.[a-z0-9]{1,8}$/i.test(extension) ? extension : kind === "audio" ? ".audio" : ".img";
+  const safeExtension = mediaExtension(extension) || (kind === "audio" ? ".audio" : ".img");
   const managedPath = await join(assetRoot, `${crypto.randomUUID()}${safeExtension}`);
   await writeFile(managedPath, bytes);
   return managedPath;
+}
+
+// Tauri extname returns "wav", unlike Node's ".wav".
+function mediaExtension(extension: string) {
+  const plain=extension.replace(/^\./, "");
+  return /^[a-z0-9]{1,8}$/i.test(plain) ? `.${plain}` : "";
 }
 
 export async function saveAutosaveProject(snapshot: ProjectSnapshot) {
@@ -314,6 +322,8 @@ export async function createProjectBundle(snapshot: ProjectSnapshot, modelRoot?:
   const zip = new JSZip();
   const bundleSnapshot: ProjectSnapshot = {
     ...snapshot,
+    projectPath: undefined,
+    fileSignature: undefined,
     document: snapshot.document ? structuredClone(snapshot.document) : undefined,
     savedAt: new Date().toISOString(),
     motionClips: snapshot.motionClips.map(stripRuntimeAudio),
@@ -336,7 +346,7 @@ export async function createProjectBundle(snapshot: ProjectSnapshot, modelRoot?:
     const cacheKey = `${kind}:${sourcePath}`;
     const existing = bundledPaths.get(cacheKey);
     if (existing) return existing;
-    const extension = await extname(sourcePath);
+    const extension = mediaExtension(await extname(sourcePath));
     const safeId = encodeURIComponent(id);
     let entryPath = `assets/${kind}/${safeId}${extension || (kind === "audio" ? ".audio" : ".img")}`;
     let size = 0;
@@ -566,7 +576,7 @@ export function stripRuntimeAudio<T extends Clip>(clip: T): Omit<T, "audioBuffer
   return stored;
 }
 
-function isProjectSnapshot(value: unknown): value is ProjectSnapshot {
+export function isProjectSnapshot(value: unknown): value is ProjectSnapshot {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<ProjectSnapshot>;
   return (candidate.version === 1 || (candidate.version === 2 && isAnimationDocument(candidate.animation)) || candidate.version === 3) &&

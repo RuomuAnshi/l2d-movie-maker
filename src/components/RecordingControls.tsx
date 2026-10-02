@@ -1,6 +1,17 @@
-import type { VideoExportFormat, VideoExportMode } from "../utils/videoExporter";
+import {
+  resolveExportPipeline,
+  type VideoExportFormat,
+  type VideoExportMethod,
+  type VideoExportMode,
+  type VideoExportPhase,
+} from "../utils/videoExporter";
+import { getWebmRecordingSupport } from "../utils/canvasRecorder";
 
 export interface RecordingControlsProps {
+  exportRangeAvailable?:boolean;
+  useMarkedExportRange?:boolean;
+  setUseMarkedExportRange?:(value:boolean)=>void;
+  estimatedStorageBytes?:number;
   recordingQuality: "low" | "medium" | "high";
   setRecordingQuality: (quality: "low" | "medium" | "high") => void;
   transparentBg: boolean;
@@ -9,12 +20,16 @@ export interface RecordingControlsProps {
   setIncludeAudio: (include: boolean) => void;
   exportFormat: VideoExportFormat;
   setExportFormat: (format: VideoExportFormat) => void;
+  exportMethod: VideoExportMethod;
+  setExportMethod: (method: VideoExportMethod) => void;
   exportMode: VideoExportMode;
   setExportMode: (mode: VideoExportMode) => void;
   exportState: "idle" | "done" | "exporting";
+  exportPhase: VideoExportPhase;
   exportTime: number;
   exportProgress: number;
-  onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean) => void;
+  onCancelExport: () => void;
+  onExportVideo: (format: VideoExportFormat, mode: VideoExportMode, includeAudio: boolean, method: VideoExportMethod) => void;
   onExportSubtitlesSrt: () => void;
   onTakeScreenshot: () => void;
   onTakePartsScreenshots: () => void;
@@ -31,19 +46,31 @@ export default function RecordingControls({
   setIncludeAudio,
   exportFormat,
   setExportFormat,
+  exportMethod,
+  setExportMethod,
   exportMode,
   setExportMode,
   exportState,
+  exportPhase,
   exportTime,
   exportProgress,
+  onCancelExport,
   onExportVideo,
   onExportSubtitlesSrt,
   onTakeScreenshot,
   onTakePartsScreenshots,
   exportSequenceLabel,
-  projectFps,
+  projectFps,exportRangeAvailable,useMarkedExportRange,setUseMarkedExportRange,estimatedStorageBytes,
 }: RecordingControlsProps) {
   const isBusy = exportState === "exporting";
+  const recordingSupport = getWebmRecordingSupport();
+  // 实际管线由格式、方式、透明背景和环境共同决定；与「方式」里的选择不一致时给出降级说明。
+  const pipeline = resolveExportPipeline({
+    format: exportFormat,
+    method: exportMethod,
+    transparentBg,
+    recordingSupported: recordingSupport.supported,
+  });
 
   return (
     <div className="recording-controls">
@@ -59,6 +86,22 @@ export default function RecordingControls({
           >
             <option value="webm">WebM · VP9</option>
             <option value="mov">MOV · ProRes 4444</option>
+          </select>
+        </label>
+
+        <label className="field-stack">
+          <span className="field-label">方式</span>
+          <select
+            className="input"
+            value={pipeline.kind}
+            disabled={isBusy || exportFormat === "mov"}
+            title={exportFormat === "mov" ? "MOV 只能逐帧渲染" : undefined}
+            onChange={(event) => setExportMethod(event.target.value as VideoExportMethod)}
+          >
+            <option value="record" disabled={!recordingSupport.supported}>
+              {recordingSupport.supported ? "实时录制" : "实时录制（不支持）"}
+            </option>
+            <option value="frames">逐帧渲染</option>
           </select>
         </label>
 
@@ -91,6 +134,8 @@ export default function RecordingControls({
         </label>
       </div>
 
+      {pipeline.note && <div className="pane-note">{pipeline.note}</div>}
+
       <div className="recording-bounds-settings">
         <label className="transparent-bg-label">
           <input
@@ -114,18 +159,19 @@ export default function RecordingControls({
         </label>
       </div>
 
+      <label className="field-stack"><span>范围</span><select className="input" aria-label="导出范围" value={useMarkedExportRange&&exportRangeAvailable?"range":"all"} disabled={isBusy} onChange={event=>setUseMarkedExportRange?.(event.target.value==="range")}><option value="all">整个序列</option><option value="range" disabled={!exportRangeAvailable}>I/O 选区</option></select></label>{pipeline.kind==="frames"&&estimatedStorageBytes!=null&&<p className="pane-note">临时帧上限约 {(estimatedStorageBytes/1024**3).toFixed(2)} GiB · PNG 压缩后通常更小</p>}
       <button
-        onClick={() => onExportVideo(exportFormat, exportMode, includeAudio)}
+        onClick={() => onExportVideo(exportFormat, exportMode, includeAudio, pipeline.kind)}
         disabled={isBusy}
         className="export-video-button"
       >
-        {isBusy ? "正在导出…" : "导出视频"}
+        {isBusy ? (exportPhase === "record" ? "正在录制…" : "正在导出…") : "导出视频"}
       </button>
 
       {isBusy ? (
         <div className="recording-progress" aria-live="polite">
           <div>
-            {exportProgress >= 85 ? "编码视频" : "渲染画面"} · {exportTime.toFixed(1)} 秒
+            {exportPhase === "record" ? "实时录制" : exportProgress >= 85 ? "编码视频" : "渲染画面"} · {exportTime.toFixed(1)} 秒
           </div>
           <div
             className="recording-progress-bar"
@@ -137,6 +183,11 @@ export default function RecordingControls({
           >
             <div className="recording-progress-fill" style={{ width: `${exportProgress}%` }} />
           </div>
+          {(
+            <button onClick={onCancelExport} className="download-button" style={{ marginTop: 6 }}>
+              {exportPhase==="record"?"取消录制":"取消导出"}
+            </button>
+          )}
         </div>
       ) : null}
 

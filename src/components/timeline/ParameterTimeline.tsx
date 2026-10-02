@@ -5,6 +5,7 @@ import {
   sortKeys,
   upsertKey,
   editSource,
+  moveSourcePriority,
   removeSource,
   reconcileSourceEdits,
 } from "../../animation/engine";
@@ -40,10 +41,12 @@ type Props = {
   onStopPlayback?: () => void;
   isPlaying?: boolean;
   fps?: number;
+  characterNames?: Record<string, string>;
   onExportAnimation?: (options: AnimationExportOptions) => Promise<string | undefined>;
 };
 type Selected = { target: string; id: string };
 export default function Timeline(p: Props) {
+  const [exportDestination,setExportDestination]=useState<AnimationExportOptions["destination"]>("file");
   const [exportKind, setExportKind] = useState<"motion" | "expression" | null>(null);
   const [pps, setPps] = useState(80),
     [search, setSearch] = useState(""),
@@ -392,11 +395,11 @@ export default function Timeline(p: Props) {
     rows.push({
       type: "heading",
       id: character,
-      name: character === "main" ? "角色" : character,
+      name: p.characterNames?.[character] ?? (character === "main" ? "角色" : character),
     });
     if (collapsed.has(character)) continue;
-    const partCount = new Set(tracks.filter(t => t.definition.characterId === character).map(t => t.definition.partId)).size;
-    const groupLabel = (t: ParameterTrack) => partCount > 1 ? `${t.definition.group} · 部件 ${t.definition.partId}` : t.definition.group;
+    const parts = [...new Set(tracks.filter(t => t.definition.characterId === character).map(t => t.definition.partId))];
+    const groupLabel = (t: ParameterTrack) => parts.length > 1 ? `${t.definition.group} · 部件 ${parts.indexOf(t.definition.partId) + 1}` : t.definition.group;
     const groups = [
       ...new Set(
         tracks
@@ -475,8 +478,8 @@ export default function Timeline(p: Props) {
             重做
           </button>
           {p.onExportAnimation && <>
-            <button className="btn btn--quiet" onClick={() => { p.onStopPlayback?.(); setExportKind("motion"); }}>导出动作</button>
-            <button className="btn btn--quiet" onClick={() => { p.onStopPlayback?.(); setExportKind("expression"); }}>导出表情</button>
+            <button className="btn btn--quiet" onClick={() => { p.onStopPlayback?.(); setExportDestination("file"); setExportKind("motion"); }}>导出动作</button>
+            <button className="btn btn--quiet" onClick={() => { p.onStopPlayback?.(); setExportDestination("file"); setExportKind("expression"); }}>导出表情</button>
           </>}
           <input
             aria-label="搜索参数"
@@ -611,6 +614,10 @@ export default function Timeline(p: Props) {
           {group && (
             <>
               <strong>{group.name}</strong>
+              <label><input type="checkbox" checked={group.enabled!==false} onChange={event=>single(()=>applyAnimation(editSource(document,group.id,{enabled:event.target.checked})))}/>启用</label>
+              <button className="btn btn--quiet" title="提高优先级" onClick={()=>single(()=>applyAnimation(moveSourcePriority(document,group.id,1)))}>优先 ↑</button>
+              <button className="btn btn--quiet" title="降低优先级" onClick={()=>single(()=>applyAnimation(moveSourcePriority(document,group.id,-1)))}>优先 ↓</button>
+              <details className="source-parameter-mask"><summary>参数范围 · {group.targetMask?.length??Object.keys(group.curves).length}</summary><button className="btn btn--quiet" onClick={()=>single(()=>applyAnimation(editSource(document,group.id,{targetMask:undefined})))}>全部</button><button className="btn btn--quiet" disabled={!selected.length} onClick={()=>single(()=>applyAnimation(editSource(document,group.id,{targetMask:[...new Set(selected.map(item=>item.target))]})))}>所选参数</button>{Object.keys(group.curves).map(target=><label key={target}><input type="checkbox" checked={!group.targetMask||group.targetMask.includes(target)} onChange={event=>{const mask=group.targetMask??Object.keys(group.curves);single(()=>applyAnimation(editSource(document,group.id,{targetMask:event.target.checked?[...mask,target]:mask.filter(item=>item!==target)})));}}/>{document.tracks.find(track=>track.definition.target===target)?.definition.name??target}</label>)}</details>
               <label>
                 速度{" "}
                 <NumberField
@@ -662,7 +669,8 @@ export default function Timeline(p: Props) {
           )}
         </div>
       )}
-      {exportKind && p.onExportAnimation && <AnimationExportDialog key={exportKind} kind={exportKind} animation={document} groupId={groupId} time={p.playheadSec} fps={p.fps ?? 30} onClose={() => setExportKind(null)} onExport={p.onExportAnimation} />}
+      {p.onExportAnimation&&<div className="performance-presets"><button className="btn btn--quiet" onClick={()=>{setExportDestination("library");setExportKind("expression");}}>保存姿态</button><button className="btn btn--quiet" onClick={()=>{setExportDestination("library");setExportKind("motion");}}>保存动作</button></div>}
+      {exportKind && p.onExportAnimation && <AnimationExportDialog key={exportKind} kind={exportKind} characterNames={p.characterNames} animation={document} groupId={groupId} selectedTargets={[...new Set(selected.map(item=>item.target))]} initialDestination={exportDestination} time={p.playheadSec} fps={p.fps ?? 30} onClose={() => setExportKind(null)} onExport={p.onExportAnimation} />}
       <div className="parameter-scroll">
         <div className="tl-layout">
           <div className="tl-side parameter-side">

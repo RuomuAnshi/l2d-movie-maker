@@ -54,6 +54,8 @@ export function isAnimationDocument(
       typeof g.name === "string" &&
       ["motion", "expression"].includes(g.kind) &&
       (g.sourceAssetId == null || (typeof g.sourceAssetId === "string" && !!g.sourceAssetId)) &&
+      (g.enabled == null || typeof g.enabled === "boolean") &&
+      (g.targetMask == null || (Array.isArray(g.targetMask) && g.targetMask.every(target => typeof target === "string"))) &&
       [g.start, g.duration, g.sourceDuration, g.offset, g.speed].every(
         Number.isFinite,
       ) &&

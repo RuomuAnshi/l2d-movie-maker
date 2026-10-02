@@ -13,7 +13,8 @@ export type AnimationExportOptions = {
   fadeIn: number;
   scope: "animated" | "all" | "material";
   groupId?: string;
-  destination: "file" | "model";
+  destination: "file" | "model" | "library";
+  targets?: string[];
 };
 export type AnimationFile = { text: string; extension: string; parameterCount: number };
 
@@ -23,6 +24,7 @@ function exportTracks(document: AnimationDocument, options: AnimationExportOptio
   const tracks = document.tracks.filter(track =>
     track.definition.characterId === options.characterId && track.definition.partId === options.partId &&
     (options.kind === "motion" || track.definition.kind === "parameter") &&
+    (!options.targets || options.targets.includes(track.definition.target)) &&
     (options.scope === "all" || (options.scope === "material" ? !!group?.curves[track.definition.target]
       : track.animated || track.baseValue !== track.definition.defaultValue)));
   if (!tracks.length) throw new Error("所选部件没有可导出的参数，请调整参数范围。");

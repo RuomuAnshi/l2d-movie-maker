@@ -3,9 +3,14 @@ import ParameterTimeline from "./ParameterTimeline";
 import type { AnimationDocument } from "../../animation/types";
 import type { AnimationExportOptions } from "../../animation/exporters";
 import { emptyAnimation } from "../../animation/types";
-import { addTrack, changeClipRate, clipVolumeAt, createCompound, createIndependentClip, deleteClips, evaluateClipTransform, insertClip, moveClips, moveClip, pasteClips, removeEmptyTrack, reorderTrack, sequenceDuration, splitClip, trimClip, updateClip } from "../../sequence/engine";
+import { addTrack, changeClipRate, clipVolumeAt, createCompound, createIndependentClip, deleteClips, evaluateClipTransform, removeEmptyTrack, reorderTrack, sequenceDuration, updateClip } from "../../sequence/engine";
+import { editTimelineClip, linkedClipIds, linkedTrimDelta, linkClips, moveTimelineClips, pasteTimelineClips, rippleDeleteClips, rippleDeleteRanges, splitTimelineClips, trimLinkedClips, unlinkClips } from "../../sequence/editing";
+import type { EditMode } from "../../sequence/editing";
+import { adjacentEditTime, formatTimecode, parseTimecode } from "../../sequence/navigation";
+import { assetRange } from "../../sequence/sourcePreview";
 import { createClip, DEFAULT_TRANSFORM } from "../../sequence/types";
-import type { Clip, ProjectAsset, ProjectDocument, Sequence, Transform } from "../../sequence/types";
+import type { Clip, ProjectAsset, ProjectDocument, Sequence, Transform, PropertyName } from "../../sequence/types";
+import { propertyLabels } from "../../sequence/properties";
 import { materialSourceFromAsset, parseMaterialSource } from "../../sequence/materials";
 import type { MaterialSource } from "../../sequence/materials";
 import "./sequenceTimeline.css";
@@ -20,6 +25,11 @@ type Props = {
   onSelectionChange?: (sequenceId: string, clipIds: string[]) => void;
   externalSelection?: { sequenceId: string; clipIds: string[] };
   showInlineInspector?: boolean;
+  linkedSelection?: boolean;
+  onLinkedSelectionChange?: (enabled: boolean) => void;
+  assetInsertRequest?: { assetId: string; serial: number };
+  onRangeChange?: (sequenceId:string, range:{start:number;end:number}|undefined)=>void;
+  onTrackSelect?: (sequenceId:string,trackId:string)=>void;
   assetThumbnails?: Record<string, string>;
   navigationResetKey?: string | number;
   onImportMaterial: (name: string, kind: "motion" | "expression", start: number, source?: MaterialSource) => void;
@@ -68,6 +78,13 @@ export default function Timeline(p: Props) {
   const [showParameters, setShowParameters] = useState(false);
   const [finalComposition, setFinalComposition] = useState(false);
   const [snapping, setSnapping] = useState(true);
+  const [editMode, setEditMode] = useState<EditMode>("free");
+  const [localLinkedSelection, setLocalLinkedSelection] = useState(true);
+  const linkedSelection = p.linkedSelection ?? localLinkedSelection;
+  const setLinkedSelection = (enabled: boolean) => { setLocalLinkedSelection(enabled); p.onLinkedSelectionChange?.(enabled); };
+  const [ranges, setRanges] = useState<Record<string, { start: number; end?: number }>>({});
+  const [issue, setIssue] = useState("");
+  const [timecodeDraft, setTimecodeDraft] = useState<string | null>(null);
   const [dragPreview, setDragPreview] = useState<DragPreview | null>(null);
   const [marquee, setMarquee] = useState<Marquee | null>(null);
   const [propertyKeyPreview, setPropertyKeyPreview] = useState<{ clipId: string; keyId: string; time: number } | null>(null);
@@ -98,9 +115,14 @@ export default function Timeline(p: Props) {
   const duration = Math.max(sequenceDuration(sequence), 5);
   const width = Math.max(1000, (duration + 2) * zoom);
   const selectedItems = useMemo(() => tracks.flatMap((track) => track.clips.filter((clip) => selected.includes(clip.id)).map((clip) => ({ track, clip }))), [tracks, selected]);
+  const mode = sequence.kind === "edit" ? editMode : "free";
+  const markedRange = ranges[currentId];
+  const rangeCallback=useRef(p.onRangeChange);rangeCallback.current=p.onRangeChange;
+  useEffect(()=>rangeCallback.current?.(currentId,markedRange?.end!=null?{start:markedRange.start,end:markedRange.end}:undefined),[currentId,markedRange]);
+  const expandSelection = (ids: string[], bypass = false) => linkedSelection && !bypass ? linkedClipIds(sequence, ids) : ids.filter((id) => tracks.some((track) => track.clips.some((clip) => clip.id === id)));
   const edit = (command: (project: ProjectDocument) => ProjectDocument) => {
-    try { p.onProjectChange(command(p.project)); return true; }
-    catch (error) { window.alert(error instanceof Error ? error.message : String(error)); return false; }
+    try { p.onProjectChange(command(p.project)); setIssue(""); return true; }
+    catch (error) { setIssue(error instanceof Error ? error.message : String(error)); return false; }
   };
   const frame = 1 / sequence.fps;
   const timeAt = (clientX: number) => {
@@ -177,10 +199,11 @@ export default function Timeline(p: Props) {
     if (!external || external.sequenceId !== currentId) return;
     const previous = selectedRef.current;
     if (previous.length !== external.clipIds.length || previous.some((id, index) => id !== external.clipIds[index])) {
-      suppressSelectionNotify.current = true;
-      setSelected([...external.clipIds]);
+      const expanded = linkedSelection ? linkedClipIds(sequence, external.clipIds) : [...external.clipIds];
+      suppressSelectionNotify.current = expanded.length === external.clipIds.length;
+      setSelected(expanded);
     }
-  }, [p.externalSelection, currentId]);
+  }, [p.externalSelection, currentId, linkedSelection, sequence]);
   useEffect(() => { skipExternalSelectionAfterNavigation.current = false; }, [currentId, path]);
   useEffect(() => {
     const start = (event: DragEvent) => {
@@ -194,13 +217,13 @@ export default function Timeline(p: Props) {
         const sequenceId = asset?.metadata?.sequenceId;
         const child = typeof sequenceId === "string" ? p.project.sequences[sequenceId] : undefined;
         const childDuration = child ? Math.max(1 / sequence.fps, sequenceDuration(child)) : undefined;
-        externalDragRef.current = { name: asset?.name ?? payload.name ?? "素材", kind: asset?.kind ?? "sequence", duration: childDuration ?? asset?.duration ?? (asset?.kind === "text" ? 3 : 5) };
+        externalDragRef.current = { name: asset?.name ?? payload.name ?? "素材", kind: asset?.kind ?? "sequence", duration: asset ? assetRange(p.project, asset).duration : childDuration ?? 5 };
       } catch { externalDragRef.current = null; }
     };
     const end = () => { externalDragRef.current = null; setDragPreview(null); };
     window.addEventListener("dragstart", start); window.addEventListener("dragend", end);
     return () => { window.removeEventListener("dragstart", start); window.removeEventListener("dragend", end); };
-  }, [p.project.assets, p.project.sequences, sequence.fps]);
+  }, [p.project, sequence.fps]);
   useLayoutEffect(() => {
     const saved = restoringScroll.current;
     if (!saved) return;
@@ -230,9 +253,54 @@ export default function Timeline(p: Props) {
     }
     notifySeek(currentId, value);
   };
+  const navigate = (time: number) => { p.onStopPlayback?.(); seek(time); };
+  const markRange = (edge: "in" | "out") => setRanges((previous) => {
+    const old = previous[currentId] ?? { start: 0 };
+    return { ...previous, [currentId]: edge === "in"
+      ? { start: localTime, end: old.end != null && old.end > localTime ? old.end : undefined }
+      : { start: Math.min(old.start, Math.max(0, localTime - frame)), end: localTime > 0 ? localTime : undefined } };
+  });
+  const fitTimeline = () => {
+    setZoom(Math.max(0.1, Math.min(360, ((scrollRef.current?.clientWidth ?? 900) - 148) / Math.max(1, sequenceDuration(sequence)))));
+    if (scrollRef.current) scrollRef.current.scrollLeft = 0;
+  };
+  const splitSelection = () => {
+    const ids = selected.length ? expandSelection(selected) : tracks.filter((track) => !track.locked).flatMap((track) => track.clips.filter((clip) => localTime > clip.start && localTime < clip.start + clip.duration).map((clip) => clip.id));
+    edit((project) => splitTimelineClips(project, currentId, ids, localTime));
+  };
+  const deleteSelection = (ripple = false) => {
+    const ids = expandSelection(selected);
+    if (!ids.length && !(ripple && markedRange?.end != null)) return;
+    let next: ProjectDocument | undefined;
+    const start = ids.length ? Math.min(...selectedItems.map(({ clip }) => clip.start)) : markedRange!.start;
+    if (edit((project) => {
+      next = ripple ? ids.length ? rippleDeleteClips(project, currentId, ids)
+        : rippleDeleteRanges(project, currentId, [{ start: markedRange!.start, end: markedRange!.end! }])
+        : deleteClips(project, currentId, ids);
+      return next;
+    })) {
+      setSelected([]);
+      if (ripple) {
+        p.onStopPlayback?.();
+        seek(Math.min(start, sequenceDuration(next!.sequences[currentId])));
+        setRanges((previous) => ({ ...previous, [currentId]: { start: 0 } }));
+      }
+    }
+  };
+  useEffect(() => { setRanges({}); setIssue(""); setTimecodeDraft(null); }, [p.project.id, p.navigationResetKey]);
+  useEffect(() => { setTimecodeDraft(null); setIssue(""); }, [currentId]);
+  useEffect(() => {
+    const valid = new Set(sequence.tracks.flatMap((track) => track.clips.map((clip) => clip.id)));
+    setSelected((previous) => previous.some((id) => !valid.has(id)) ? previous.filter((id) => valid.has(id)) : previous);
+  }, [sequence]);
+  useEffect(() => {
+    if (!p.isPlaying || showParameters || !scrollRef.current) return;
+    const body = scrollRef.current, x = localTime * zoom;
+    if (x < body.scrollLeft || x > body.scrollLeft + body.clientWidth - 156) body.scrollLeft = Math.max(0, x - (body.clientWidth - 156) / 3);
+  }, [localTime, p.isPlaying, showParameters, zoom]);
   const startRulerDrag = (event: React.MouseEvent) => {
     if (event.button !== 0) return;
-    event.preventDefault(); gestureCancelRef.current?.(); p.onStopPlayback?.(); seek(timeAt(event.clientX));
+    event.preventDefault(); rootRef.current?.focus({ preventScroll: true }); gestureCancelRef.current?.(); p.onStopPlayback?.(); seek(timeAt(event.clientX));
     const move = (pointer: MouseEvent) => seek(timeAt(pointer.clientX));
     const up = (pointer: MouseEvent) => { cancel(); seek(timeAt(pointer.clientX)); };
     const cancel = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); gestureCancelRef.current = null; };
@@ -280,8 +348,7 @@ export default function Timeline(p: Props) {
       targetTrackId = next.sequences[currentId].tracks.slice().sort((a, b) => b.order - a.order)[0].id;
     }
     const clip = createClip({ id, kind: "text", assetId: asset.id, name: "文字", text: "双击编辑", start: localTime, duration: 3 });
-    edit(() => insertClip(next, currentId, targetTrackId!, clip).project);
-    setSelected([id]);
+    if (edit(() => editTimelineClip(next, currentId, targetTrackId!, clip, mode).project)) setSelected([id]);
   };
   const addDroppedAsset = (assetId: string, trackId: string, at: number, supplied?: ProjectAsset, targetClipId?: string) => {
     const asset = supplied ?? p.project.assets[assetId];
@@ -312,15 +379,20 @@ export default function Timeline(p: Props) {
     } else {
       clip = createClip({ kind: asset.kind, assetId: asset.id, name: asset.name, start: at, duration: asset.duration ?? (asset.kind === "text" ? 3 : 5) });
     }
+    const range = assetRange(next,asset);
+    clip = {...clip,sourceIn:range.sourceIn,duration:Math.max(frame,range.duration)};
     let target = tracks.find((track) => track.id === trackId) ?? tracks[0];
     if (!target) {
       next = addTrack(next, currentId);
       target = next.sequences[currentId].tracks[0];
     }
-    const inserted = insertClip(next, currentId, target.id, clip);
+    const inserted = editTimelineClip(next, currentId, target.id, clip, mode);
     p.onProjectChange(inserted.project);
+    setIssue("");
     setSelected([clip.id]);
   };
+  const assetInsertRef=useRef<()=>void>(()=>{});assetInsertRef.current=()=>{const request=p.assetInsertRequest;if(request)addDroppedAsset(request.assetId,focusedTrackId,localTime,undefined,selectedItems[0]?.clip.id);};
+  useEffect(()=>{const request=p.assetInsertRequest;if(!request)return;try{assetInsertRef.current();}catch(error){setIssue(String(error));}},[p.assetInsertRequest]);
   const onDrop = (event: React.DragEvent, trackId: string) => {
     event.preventDefault();
     event.stopPropagation();
@@ -334,11 +406,12 @@ export default function Timeline(p: Props) {
         const targetId = (event.target as HTMLElement).closest<HTMLElement>("[data-clip-id]")?.dataset.clipId;
         if (payload.assetId) addDroppedAsset(payload.assetId, trackId, at, undefined, targetId);
         else if (payload.modelPath) {
-          const assetId = `asset:model:${crypto.randomUUID()}`;
-          addDroppedAsset(assetId, trackId, at, { id: assetId, kind: "live2d", name: payload.name ?? payload.modelPath, uri: payload.modelPath, duration: 5 });
+          const existing=Object.values(p.project.assets).find(asset=>asset.kind==="live2d"&&asset.uri===payload.modelPath);
+          const assetId=existing?.id??`asset:model:${crypto.randomUUID()}`;
+          addDroppedAsset(assetId,trackId,at,existing??{id:assetId,kind:"live2d",name:payload.name??payload.modelPath,uri:payload.modelPath,duration:5});
         }
       }
-      catch (error) { window.alert(error instanceof Error ? error.message : "无法放入该素材。"); }
+      catch (error) { setIssue(error instanceof Error ? error.message : "无法放入该素材。"); }
       return;
     }
     const material = event.dataTransfer.getData(MATERIAL_MIME);
@@ -349,7 +422,7 @@ export default function Timeline(p: Props) {
           const targetId = (event.target as HTMLElement).closest<HTMLElement>("[data-clip-id]")?.dataset.clipId;
           importMaterialAt(payload.name, payload.kind, at, targetId, payload.source ? parseMaterialSource(payload.source) : undefined);
         }
-      } catch (error) { window.alert(error instanceof Error ? error.message : "无法导入该素材。"); }
+      } catch (error) { setIssue(error instanceof Error ? error.message : "无法导入该素材。"); }
     }
   };
   const importMaterialAt = (name: string, kind: "motion" | "expression", at: number, targetClipId?: string, source?: MaterialSource) => {
@@ -360,7 +433,7 @@ export default function Timeline(p: Props) {
     }
     const target = tracks.filter((track) => !track.locked).flatMap((track) => track.clips)
       .find((clip) => clip.id === targetClipId && clip.kind === "sequence" && clip.sequenceId && p.project.sequences[clip.sequenceId]?.kind === "live2d" && at >= clip.start && at <= clip.start + clip.duration);
-    if (!target?.sequenceId) { window.alert("动作和表情需要放到 Live2D 片段上。请将素材拖到对应片段中。"); return; }
+    if (!target?.sequenceId) { setIssue("动作和表情需要放到 Live2D 片段上。请将素材拖到对应片段中。"); return; }
     const sourceTime = target.sourceIn + (at - target.start) * target.rate;
     if (p.onImportIntoSequence) p.onImportIntoSequence(target.sequenceId, name, kind, sourceTime, source);
     else p.onImportMaterial(name, kind, sourceTime, source);
@@ -382,8 +455,8 @@ export default function Timeline(p: Props) {
     event.dataTransfer.dropEffect = invalid ? "none" : "copy";
     const draggedAsset = externalDragRef.current;
     const duration = draggedAsset?.duration ?? 5;
-    const createsTrack = track?.clips.some((clip) => start < clip.start + clip.duration && start + duration > clip.start);
-    setDragPreview({ clips: [{ id: "drop", trackId, start, duration, name: draggedAsset?.name ?? "素材", kind: draggedAsset?.kind ?? "sequence" }], label: invalid ? "轨道已锁定" : `${start.toFixed(2)} 秒 · ${duration.toFixed(2)} 秒${createsTrack ? " · 新轨道" : ""}`, snapAt, invalid, createsTrack });
+    const createsTrack = mode === "free" && track?.clips.some((clip) => start < clip.start + clip.duration && start + duration > clip.start);
+    setDragPreview({ clips: [{ id: "drop", trackId, start, duration, name: draggedAsset?.name ?? "素材", kind: draggedAsset?.kind ?? "sequence" }], label: invalid ? "轨道已锁定" : `${formatTimecode(start, sequence.fps)} · ${mode === "insert" ? "插入" : mode === "overwrite" ? "覆盖" : createsTrack ? "新轨道" : "放置"}`, snapAt, invalid, createsTrack });
   };
   const startClipDrag = (event: React.MouseEvent, trackId: string, clip: Clip, edge?: "left" | "right") => {
     if (event.button !== 0) return;
@@ -393,7 +466,8 @@ export default function Timeline(p: Props) {
     event.currentTarget.closest<HTMLElement>(".tl-root")?.focus();
     setFocusedTrackId(trackId);
     const additive = event.shiftKey || event.ctrlKey || event.metaKey;
-    const movingIds = edge ? [clip.id] : additive ? selected.includes(clip.id) ? selected.filter((id) => id !== clip.id) : [...selected, clip.id] : selected.includes(clip.id) ? selected : [clip.id];
+    const clicked = expandSelection([clip.id], event.altKey);
+    const movingIds = edge ? clicked : additive ? selected.includes(clip.id) ? selected.filter((id) => !clicked.includes(id)) : [...new Set([...selected, ...clicked])] : selected.includes(clip.id) && !event.altKey ? expandSelection(selected) : clicked;
     setSelected(movingIds);
     if (tracks.find((track) => track.id === trackId)?.locked || !movingIds.includes(clip.id)) return;
     const originX = event.clientX;
@@ -418,20 +492,15 @@ export default function Timeline(p: Props) {
       let delta = snapped.value - originalEdge;
       let ghosts: ClipGhost[];
       if (edge) {
-        if (edge === "left") delta = Math.max(-clip.start, -clip.sourceIn / clip.rate, Math.min(delta, clip.duration - frame));
-        else {
-          delta = Math.max(frame - clip.duration, delta);
-          const sourceDuration = p.audioSourceDuration?.(clip);
-          if (clip.kind === "audio" && sourceDuration != null) delta = Math.min(delta, Math.max(frame, (sourceDuration - clip.sourceIn) / clip.rate) - clip.duration);
-        }
-        ghosts = [{ id: clip.id, trackId, start: clip.start + (edge === "left" ? delta : 0), duration: clip.duration + (edge === "left" ? -delta : delta), name: clip.name, kind: clip.kind }];
+        delta = linkedTrimDelta(p.project, currentId, movingIds, edge, delta);
+        ghosts = moving.map(({ track, clip: item }) => ({ id: item.id, trackId: track.id, start: item.start + (edge === "left" ? delta : 0), duration: item.duration + (edge === "left" ? -delta : delta), name: item.name, kind: item.kind }));
       } else {
         delta = Math.max(-Math.min(...moving.map(({ clip: item }) => item.start)), delta);
         const orderDelta = Math.max(-Math.min(...moving.map(({ track }) => track.order)), targetTrack.order - originalTrack.order);
         ghosts = moving.map(({ track, clip: item }) => ({ id: item.id, trackId: tracks.find((candidate) => candidate.order === track.order + orderDelta)?.id ?? targetTrack.id, start: item.start + delta, duration: item.duration, name: item.name, kind: item.kind }));
       }
       const invalid = moving.some(({ track }) => track.locked) || targetTrack.locked || ghosts.some((ghost) => tracks.find((track) => track.id === ghost.trackId)?.locked);
-      const createsTrack = ghosts.some((ghost) => tracks.find((track) => track.id === ghost.trackId)?.clips.some((item) => !movingIds.includes(item.id) && ghost.start < item.start + item.duration && ghost.start + ghost.duration > item.start));
+      const createsTrack = (edge || mode === "free") && ghosts.some((ghost) => tracks.find((track) => track.id === ghost.trackId)?.clips.some((item) => !movingIds.includes(item.id) && ghost.start < item.start + item.duration && ghost.start + ghost.duration > item.start));
       return { delta, targetTrackId: targetTrack.id, preview: { clips: ghosts, label: invalid ? "轨道已锁定" : `${ghosts[0]?.start.toFixed(2)} 秒${createsTrack ? " · 新轨道" : ""}`, snapAt: snapped.snapAt, invalid, createsTrack } };
     };
     const onMove = (moveEvent: MouseEvent) => {
@@ -444,8 +513,8 @@ export default function Timeline(p: Props) {
       suppressClick.current = true;
       const { delta, targetTrackId, preview } = dragPosition(upEvent, false);
       if (preview.invalid) return;
-      if (edge) edit((project) => trimClip(project, currentId, trackId, clip.id, edge, delta, sequence.fps, p.audioSourceDuration?.(clip)));
-      else if (targetTrackId !== trackId || delta !== 0) edit((project) => moveClips(project, currentId, movingIds, clip.id, targetTrackId, clip.start + delta, sequence.fps));
+      if (edge) edit((project) => trimLinkedClips(project, currentId, movingIds, edge, delta));
+      else if (targetTrackId !== trackId || delta !== 0) edit((project) => moveTimelineClips(project, currentId, movingIds, clip.id, targetTrackId, clip.start + delta, mode));
     };
     const cancel = () => {
       window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp);
@@ -478,7 +547,7 @@ export default function Timeline(p: Props) {
         const top = rect.top - bodyRect.top + body.scrollTop;
         return left < box.left + box.width && left + rect.width > box.left && top < box.top + box.height && top + rect.height > box.top;
       }).map((element) => element.dataset.clipId!);
-      setSelected([...new Set([...baseline, ...hits])]);
+      setSelected(expandSelection([...new Set([...baseline, ...hits])], pointer.altKey));
     };
     const onUp = (pointer: MouseEvent) => {
       cancel();
@@ -491,6 +560,7 @@ export default function Timeline(p: Props) {
   };
   const currentAssetLabel = (clip: Clip) => clip.kind === "sequence" ? p.project.sequences[clip.sequenceId ?? ""]?.kind === "live2d" ? "Live2D" : "复合" : ({ live2d: "Live2D", image: "图片", audio: "音频", text: "文字" } as const)[clip.kind];
   const clipThumbnail = (clip: Clip) => {
+    if(clip.kind === "audio" || clip.kind === "text")return undefined;
     const child = clip.sequenceId ? p.project.sequences[clip.sequenceId] : undefined;
     const assetId = child?.kind === "live2d" ? child.actors[0]?.assetId : clip.assetId;
     const asset = assetId ? p.project.assets[assetId] : undefined;
@@ -535,12 +605,13 @@ export default function Timeline(p: Props) {
       patchSelected({ volumeKeys: [...inspectorClip.volumeKeys.filter((item) => item.id !== volumeKey?.id), key].sort((a, b) => a.time - b.time) });
     } else patchSelected({ volume: value });
   };
-  const startPropertyKeyDrag = (event: React.MouseEvent, trackId: string, clip: Clip, kind: "transform" | "volume", id: string) => {
+  const startPropertyKeyDrag = (event: React.MouseEvent, trackId: string, clip: Clip, kind: "transform" | "volume" | `property:${PropertyName}`, id: string) => {
     if (event.button !== 0) return;
     gestureCancelRef.current?.();
     event.preventDefault(); event.stopPropagation();
     setSelected([clip.id]); setFocusedTrackId(trackId);
-    const keys = kind === "transform" ? clip.transformKeys : clip.volumeKeys;
+    const property = kind.startsWith("property:") ? kind.slice(9) as PropertyName : undefined;
+    const keys = property ? clip.propertyCurves?.[property]?.keys ?? [] : kind === "transform" ? clip.transformKeys : clip.volumeKeys;
     const key = keys.find((item) => item.id === id);
     if (!key) return;
     const at = clip.start + (key.time - clip.sourceIn) / clip.rate;
@@ -560,7 +631,8 @@ export default function Timeline(p: Props) {
       cancel();
       if (!dragged) return;
       suppressClick.current = true;
-      const patch = kind === "transform" ? { transformKeys: clip.transformKeys.filter((item) => item.id === id || Math.abs(item.time - targetTime) > 1e-6).map((item) => item.id === id ? { ...item, time: targetTime } : item).sort((a, b) => a.time - b.time) }
+      const curve = property ? clip.propertyCurves?.[property] : undefined;
+      const patch = property && curve ? { propertyCurves: { ...clip.propertyCurves, [property]: { ...curve, keys: curve.keys.filter(item => item.id === id || Math.abs(item.time-targetTime)>1e-6).map(item => item.id === id ? {...item,time:targetTime,inHandle:item.inHandle&&{...item.inHandle,time:item.inHandle.time+targetTime-key.time},outHandle:item.outHandle&&{...item.outHandle,time:item.outHandle.time+targetTime-key.time}} : item).sort((a,b)=>a.time-b.time) } } } : kind === "transform" ? { transformKeys: clip.transformKeys.filter((item) => item.id === id || Math.abs(item.time - targetTime) > 1e-6).map((item) => item.id === id ? { ...item, time: targetTime } : item).sort((a, b) => a.time - b.time) }
         : { volumeKeys: clip.volumeKeys.filter((item) => item.id === id || Math.abs(item.time - targetTime) > 1e-6).map((item) => item.id === id ? { ...item, time: targetTime } : item).sort((a, b) => a.time - b.time) };
       edit((project) => updateClip(project, currentId, trackId, clip.id, patch, sequence.fps));
     };
@@ -574,6 +646,23 @@ export default function Timeline(p: Props) {
     if (event.defaultPrevented || event.target instanceof HTMLInputElement || event.target instanceof HTMLSelectElement || event.target instanceof HTMLTextAreaElement) return;
     const command = event.metaKey || event.ctrlKey;
     if (command && event.key.toLowerCase() === "z") { event.preventDefault(); if (event.shiftKey) p.onRedoProject(); else p.onUndoProject(); }
+    else if (command && event.key.toLowerCase() === "a" && !showParameters) { event.preventDefault(); setSelected(tracks.flatMap((track) => track.clips.map((clip) => clip.id))); }
+    else if (command && event.key.toLowerCase() === "b" && !showParameters) { event.preventDefault(); splitSelection(); }
+    else if (command && event.key.toLowerCase() === "l" && !showParameters) {
+      event.preventDefault(); edit((project) => event.shiftKey ? unlinkClips(project, currentId, selected) : linkClips(project, currentId, selected));
+    }
+    else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const delta = (event.key === "ArrowLeft" ? -1 : 1) * frame * (event.shiftKey ? 10 : 1);
+      if (event.altKey && selectedItems.length && !showParameters) edit((project) => moveTimelineClips(project, currentId, expandSelection(selected), selectedItems[0].clip.id, selectedItems[0].track.id, selectedItems[0].clip.start + delta, "free"));
+      else navigate(command ? event.key === "ArrowLeft" ? 0 : sequenceDuration(sequence) : localTime + delta);
+    }
+    else if (event.key === "ArrowUp" || event.key === "ArrowDown") { event.preventDefault(); navigate(adjacentEditTime(sequence, localTime, event.key === "ArrowUp" ? -1 : 1)); }
+    else if (event.key === "Home" || event.key === "End") { event.preventDefault(); navigate(event.key === "Home" ? 0 : sequenceDuration(sequence)); }
+    else if (!command && event.key.toLowerCase() === "i") { event.preventDefault(); markRange("in"); }
+    else if (!command && event.key.toLowerCase() === "o") { event.preventDefault(); markRange("out"); }
+    else if (!command && event.altKey && event.code === "KeyX") { event.preventDefault(); setRanges((previous) => ({ ...previous, [currentId]: { start: 0 } })); }
+    else if (!command && event.shiftKey && event.key.toLowerCase() === "z") { event.preventDefault(); fitTimeline(); }
     else if (command && event.key.toLowerCase() === "c") {
       event.preventDefault();
       const ordered = selectedItems.slice().sort((a, b) => a.track.order - b.track.order || a.clip.start - b.clip.start);
@@ -588,11 +677,12 @@ export default function Timeline(p: Props) {
       const target = tracks.find((item) => item.id === focusedTrackId && !item.locked) ?? tracks.find((item) => !item.locked);
       if (!target) return;
       try {
-        const result = pasteClips(p.project, currentId, target.id, localTime, clipboard, sequence.fps);
+        const result = pasteTimelineClips(p.project, currentId, target.id, localTime, clipboard, mode);
         p.onProjectChange(result.project); setSelected(result.clipIds);
-      } catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
-    } else if ((event.key === "Delete" || event.key === "Backspace") && selected.length) {
-      event.preventDefault(); if (edit((project) => deleteClips(project, currentId, selected))) setSelected([]);
+        setIssue("");
+      } catch (error) { setIssue(error instanceof Error ? error.message : String(error)); }
+    } else if ((event.key === "Delete" || event.key === "Backspace") && !showParameters) {
+      event.preventDefault(); deleteSelection(event.shiftKey);
     }
   }}>
     <header className="seq-tl-header">
@@ -607,6 +697,14 @@ export default function Timeline(p: Props) {
         {sequence.kind === "live2d" && <button onClick={() => setShowParameters((value) => !value)}>{showParameters ? "剪辑" : "参数"}</button>}
         {!!path.length && <button className={finalComposition ? "active" : ""} aria-pressed={finalComposition} onClick={() => { const next = !finalComposition; setFinalComposition(next); notifySeek(currentId, localTime, path, next); }}>{finalComposition ? "最终合成" : "当前序列"}</button>}
         <button className={snapping ? "active" : ""} aria-pressed={snapping} title="吸附到播放头与片段边缘；按住 Option / Alt 临时关闭" onClick={() => setSnapping((value) => !value)}>吸附</button>
+        {!showParameters && <>
+          {sequence.kind === "edit" && <select aria-label="剪辑方式" title="自由：碰撞新建轨道；插入：所有轨道腾出时间；覆盖：替换目标轨道区间" value={editMode} onChange={(event) => setEditMode(event.target.value as EditMode)}><option value="free">自由</option><option value="insert">插入</option><option value="overwrite">覆盖</option></select>}
+          <button className={linkedSelection ? "active" : ""} aria-pressed={linkedSelection} title="关联选择；按住 Option / Alt 可单独拖动片段" onClick={() => { const next = !linkedSelection; setLinkedSelection(next); if (next) setSelected(linkedClipIds(sequence, selected)); }}>联动</button>
+          {selectedItems.length > 1 && <button title="关联所选片段 · ⌘/Ctrl L" onClick={() => edit((project) => linkClips(project, currentId, selected))}>关联</button>}
+          {selectedItems.some(({ clip }) => clip.linkGroupId) && <button title="解除关联 · ⇧⌘/Ctrl L" onClick={() => edit((project) => unlinkClips(project, currentId, selected))}>解除</button>}
+          <button disabled={!(selected.length ? selectedItems : tracks.filter((track) => !track.locked).flatMap((track) => track.clips.map((clip) => ({ track, clip })))).some(({ clip }) => localTime > clip.start && localTime < clip.start + clip.duration)} title="分割所选片段；未选时分割播放头下未锁定片段 · ⌘/Ctrl B" onClick={splitSelection}>分割</button>
+          {sequence.kind === "edit" && <button disabled={!selected.length && markedRange?.end == null} title="删除所选片段覆盖的时间；未选片段时删除 I/O 范围。所有轨道同步闭合 · Shift Delete" onClick={() => deleteSelection(true)}>波纹删除</button>}
+        </>}
         <button onClick={addText}>＋文字</button>
         {selectedItems.length > 1 && <button onClick={() => {
           try {
@@ -615,19 +713,26 @@ export default function Timeline(p: Props) {
             const project = { ...made.project, assets: { ...made.project.assets, [assetId]: { id: assetId, kind: "sequence" as const, name: made.project.sequences[made.sequenceId].name, uri: "", duration: sequenceDuration(made.project.sequences[made.sequenceId]), metadata: { sequenceId: made.sequenceId } } } };
             p.onProjectChange(project); setSelected([made.clipId]);
           }
-          catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+          catch (error) { setIssue(error instanceof Error ? error.message : String(error)); }
         }}>复合</button>}
-        <button onClick={() => setZoom((value) => Math.max(18, value / 1.2))}>−</button><button onClick={() => setZoom((value) => Math.min(360, value * 1.2))}>＋</button>
-        <span>{localTime.toFixed(2)} 秒</span>
+        <button title="缩小时间线" onClick={() => setZoom((value) => Math.max(0.1, value / 1.2))}>−</button><button title="放大时间线" onClick={() => setZoom((value) => Math.min(360, value * 1.2))}>＋</button>
+        {!showParameters && <button title="适应整个序列 · Shift Z" onClick={fitTimeline}>适应</button>}
+        <button title="上一帧 · ←；Shift ← 退十帧" aria-label="上一帧" onClick={() => navigate(localTime - frame)}>‹</button>
+        <button title="下一帧 · →；Shift → 进十帧" aria-label="下一帧" onClick={() => navigate(localTime + frame)}>›</button>
+        <input className="seq-timecode" aria-label="播放头时间码" title="时:分:秒:帧；也可输入秒数。非丢帧时间码" value={timecodeDraft ?? formatTimecode(localTime, sequence.fps)} onFocus={() => setTimecodeDraft(formatTimecode(localTime, sequence.fps))} onChange={(event) => setTimecodeDraft(event.target.value)} onBlur={(event) => {
+          if (timecodeDraft != null) { try { navigate(parseTimecode(event.currentTarget.value, sequence.fps)); setIssue(""); } catch (error) { setIssue(error instanceof Error ? error.message : String(error)); } }
+          setTimecodeDraft(null);
+        }} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); else if (event.key === "Escape") { event.currentTarget.value = formatTimecode(localTime, sequence.fps); setTimecodeDraft(null); event.currentTarget.blur(); } }} />
       </div>
     </header>
+    {issue && <div className="seq-tl-issue" role="status"><span>{issue}</span><button aria-label="关闭提示" onClick={() => setIssue("")}>×</button></div>}
     {finalComposition && path.length > 0 && finalTime === undefined && <div className="seq-tl-range-notice" role="status">当前时间超出父片段范围</div>}
     {p.showInlineInspector !== false && inspectorClip && <div className="seq-tl-inspector" inert={selectedItems[0]?.track.locked} onFocusCapture={(event) => { if ((event.target as HTMLElement).matches("input,select,textarea")) p.onBeginProjectEdit?.(); }} onBlurCapture={(event) => { if ((event.target as HTMLElement).matches("input,select,textarea")) p.onEndProjectEdit?.(); }}>
       <b>{inspectorClip.name}</b><span>{currentAssetLabel(inspectorClip)}</span>
-      <label>起点<input aria-label="片段起点" type="number" min="0" step={frame} value={Number(inspectorClip.start.toFixed(3))} onChange={(event) => edit((project) => moveClip(project, currentId, selectedItems[0].track.id, inspectorClip.id, selectedItems[0].track.id, Math.max(0, Number(event.target.value)), sequence.fps).project)} /></label>
+      <label>起点<input aria-label="片段起点" type="number" min="0" step={frame} value={Number(inspectorClip.start.toFixed(3))} onChange={(event) => edit((project) => moveTimelineClips(project, currentId, expandSelection([inspectorClip.id]), inspectorClip.id, selectedItems[0].track.id, Math.max(0, Number(event.target.value)), "free"))} /></label>
       <label>入点<input aria-label="素材入点" type="number" min="0" step={frame} value={Number(inspectorClip.sourceIn.toFixed(3))} onChange={(event) => edit((project) => updateClip(project, currentId, selectedItems[0].track.id, inspectorClip.id, { sourceIn: Math.max(0, Number(event.target.value)) }, sequence.fps))} /></label>
       <label>速率<input aria-label="片段速率" type="number" min="0.1" max="8" step="0.1" value={Number(inspectorClip.rate.toFixed(2))} onChange={(event) => edit((project) => changeClipRate(project, currentId, selectedItems[0].track.id, inspectorClip.id, Number(event.target.value), sequence.fps))} /></label>
-      <label>时长<input aria-label="片段时长" type="number" min={frame} step={frame} value={Number(inspectorClip.duration.toFixed(3))} onChange={(event) => edit((project) => updateClip(project, currentId, selectedItems[0].track.id, inspectorClip.id, { duration: Number(event.target.value) }, sequence.fps))} /></label>
+      <label>时长<input aria-label="片段时长" type="number" min={frame} step={frame} value={Number(inspectorClip.duration.toFixed(3))} onChange={(event) => edit((project) => trimLinkedClips(project, currentId, expandSelection([inspectorClip.id]), "right", Number(event.target.value) - inspectorClip.duration))} /></label>
       {inspectorClip.kind === "audio" ? <>
         <label>音量<input aria-label="片段音量" type="number" min="0" max="4" step="0.05" value={Number(inspectorVolume.toFixed(3))} onChange={(event) => patchVolume(Math.max(0, Number(event.target.value)))} /></label>
         <button disabled={!inspectorClipVisible} className={volumeKey ? "active" : ""} title={!inspectorClipVisible ? "播放头不在片段内" : volumeKey ? "删除当前音量关键帧" : "添加音量关键帧"} aria-label={volumeKey ? "删除当前音量关键帧" : "添加音量关键帧"} onClick={() => patchSelected({ volumeKeys: volumeKey ? inspectorClip.volumeKeys.filter((key) => key.id !== volumeKey.id) : [...inspectorClip.volumeKeys, { id: crypto.randomUUID(), time: inspectorSourceTime, value: inspectorVolume }].sort((a, b) => a.time - b.time) })}>{volumeKey ? "◆" : "◇"}</button>
@@ -651,13 +756,14 @@ export default function Timeline(p: Props) {
       </>}
       {inspectorClip.kind === "sequence" ? <button onClick={() => {
         try { const made = createIndependentClip(p.project, currentId, selectedItems[0].track.id, inspectorClip.id); p.onProjectChange(made.project); setSelected([made.clipId]); }
-        catch (error) { window.alert(error instanceof Error ? error.message : String(error)); }
+        catch (error) { setIssue(error instanceof Error ? error.message : String(error)); }
       }}>独立副本</button> : null}
-      <button onClick={() => edit((project) => splitClip(project, currentId, selectedItems[0].track.id, inspectorClip.id, localTime, sequence.fps))}>分割</button>
-      <button onClick={() => { if (edit((project) => deleteClips(project, currentId, [inspectorClip.id]))) setSelected([]); }}>删除</button>
+      <button onClick={splitSelection}>分割</button>
+      <button onClick={() => deleteSelection()}>删除</button>
     </div>}
     {showParameters ? <ParameterTimeline
       fps={sequence.fps}
+      characterNames={sequence.kind === "live2d" ? Object.fromEntries(sequence.actors.map(actor=>[actor.id,actor.name])) : undefined}
       onExportAnimation={p.onExportAnimation ? options => p.onExportAnimation!(sequence.id, options) : undefined}
       onImportMaterial={(name, kind, start, source) => importMaterialAt(name, kind, start, undefined, source)}
       animation={parameterDocument}
@@ -676,9 +782,9 @@ export default function Timeline(p: Props) {
       onStopPlayback={p.onStopPlayback}
     /> : <>
       <div className="seq-tl-body" ref={scrollRef} onMouseDown={startMarquee} onClickCapture={(event) => { if (suppressClick.current) { event.preventDefault(); event.stopPropagation(); suppressClick.current = false; } }} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragPreview(null); }}>
-        <div className="seq-tl-ruler-row"><div className="seq-tl-left-tools"><button onClick={() => edit((project) => addTrack(project, currentId))}>＋轨道</button><button onClick={addText}>＋文字</button></div><div className="seq-tl-ruler" style={{ width }} onMouseDown={startRulerDrag}>{Array.from({ length: Math.ceil(width / zoom / 1) + 1 }, (_, second) => <span key={second} style={{ left: second * zoom }}>{second}s</span>)}<i style={{ left: localTime * zoom }} /> </div></div>
+        <div className="seq-tl-ruler-row"><div className="seq-tl-left-tools"><button title="新增轨道" onClick={() => edit((project) => addTrack(project, currentId))}>＋轨道</button><button title="设置入点 · I" className={markedRange ? "active" : ""} onClick={() => markRange("in")}>I</button><button title="设置出点 · O；Option X 清除范围" className={markedRange?.end != null ? "active" : ""} onClick={() => markRange("out")}>O</button></div><div className="seq-tl-ruler" style={{ width }} onMouseDown={startRulerDrag}>{Array.from({ length: Math.ceil(width / zoom / Math.max(1, Math.ceil(48 / zoom))) + 1 }, (_, index) => index * Math.max(1, Math.ceil(48 / zoom))).map((second) => <span key={second} style={{ left: second * zoom }}>{second}s</span>)}{markedRange && <div className="seq-tl-marked-range" style={{ left: markedRange.start * zoom, width: Math.max(2, ((markedRange.end ?? localTime) - markedRange.start) * zoom) }} />}<i style={{ left: localTime * zoom }} /> </div></div>
         {tracks.map((track) => <div className={`seq-tl-track-row${track.locked ? " is-locked" : ""}`} data-track-id={track.id} key={track.id} onMouseDownCapture={() => setFocusedTrackId(track.id)} onDragOver={(event) => previewDrop(event, track.id)} onDrop={(event) => onDrop(event, track.id)}>
-          <div className="seq-tl-track-head">
+          <div className="seq-tl-track-head" onMouseDown={event=>{event.stopPropagation();setSelected([]);setFocusedTrackId(track.id);p.onTrackSelect?.(currentId,track.id);}}>
             <input aria-label="轨道名称" value={track.name} onFocus={() => p.onBeginProjectEdit?.()} onBlur={() => p.onEndProjectEdit?.()} onChange={(event) => edit((project) => ({ ...project, sequences: { ...project.sequences, [currentId]: { ...sequence, tracks: sequence.tracks.map((item) => item.id === track.id ? { ...item, name: event.target.value } : item) } } }))} />
             <div className="seq-tl-track-controls"><button title="锁定" className={track.locked ? "active" : ""} onClick={() => edit((project) => ({ ...project, sequences: { ...project.sequences, [currentId]: { ...sequence, tracks: sequence.tracks.map((item) => item.id === track.id ? { ...item, locked: !item.locked } : item) } } }))}>锁</button><button title="隐藏画面" className={track.hidden ? "active" : ""} onClick={() => edit((project) => ({ ...project, sequences: { ...project.sequences, [currentId]: { ...sequence, tracks: sequence.tracks.map((item) => item.id === track.id ? { ...item, hidden: !item.hidden } : item) } } }))}>显</button><button title="静音" className={track.muted ? "active" : ""} onClick={() => edit((project) => ({ ...project, sequences: { ...project.sequences, [currentId]: { ...sequence, tracks: sequence.tracks.map((item) => item.id === track.id ? { ...item, muted: !item.muted } : item) } } }))}>音</button><button title="上移轨道" onClick={() => edit((project) => reorderTrack(project, currentId, track.id, track.order - 1))}>↑</button><button title="下移轨道" onClick={() => edit((project) => reorderTrack(project, currentId, track.id, track.order + 1))}>↓</button><button title="删除空轨道" disabled={!!track.clips.length} onClick={() => edit((project) => removeEmptyTrack(project, currentId, track.id))}>×</button></div>
           </div>
@@ -689,8 +795,8 @@ export default function Timeline(p: Props) {
                 if (value !== null) edit((project) => updateClip(project, currentId, track.id, clip.id, { text: value, name: value.trim().slice(0, 18) || "文字" }, sequence.fps));
               } else enter(clip);
             }} title={`${clip.name} · ${clip.start.toFixed(2)}–${(clip.start + clip.duration).toFixed(2)}s`}>
-              <span className="seq-clip-grip" onMouseDown={(event) => startClipDrag(event, track.id, clip, "left")} />{clipThumbnail(clip) && <img className="seq-clip-thumbnail" src={clipThumbnail(clip)} alt="" draggable={false} />}{clip.kind === "audio" && <svg className="seq-clip-waveform" viewBox="0 0 100 20" preserveAspectRatio="none" aria-hidden="true"><path d={waveformPath(clip)} /></svg>}<strong>{clip.name}</strong><small>{currentAssetLabel(clip)}</small>
-              {[...clip.transformKeys.map((key) => ({ ...key, kind: "transform" as const })), ...clip.volumeKeys.map((key) => ({ ...key, kind: "volume" as const }))].filter((key) => key.time >= clip.sourceIn && key.time <= clip.sourceIn + clip.duration * clip.rate).map((key) => <button key={key.id} className="seq-property-key" title={`${key.kind === "transform" ? "画面" : "音量"}关键帧 · ${key.time.toFixed(3)} 秒`} aria-label={`${key.kind === "transform" ? "画面" : "音量"}关键帧`} style={{ left: ((propertyKeyPreview?.clipId === clip.id && propertyKeyPreview.keyId === key.id ? propertyKeyPreview.time : key.time) - clip.sourceIn) / clip.rate * zoom }} onMouseDown={(event) => startPropertyKeyDrag(event, track.id, clip, key.kind, key.id)} onDoubleClick={(event) => event.stopPropagation()}>◆</button>)}
+              <span className="seq-clip-grip" onMouseDown={(event) => startClipDrag(event, track.id, clip, "left")} />{clip.linkGroupId && <svg className="seq-clip-link" viewBox="0 0 16 16" aria-label="关联片段"><path d="M6 10l4-4M5 8l-1 1a3 3 0 004 4l2-2M11 8l1-1a3 3 0 00-4-4L6 5" /></svg>}{clipThumbnail(clip) && <img className="seq-clip-thumbnail" src={clipThumbnail(clip)} alt="" draggable={false} />}{clip.kind === "audio" && <svg className="seq-clip-waveform" viewBox="0 0 100 20" preserveAspectRatio="none" aria-hidden="true"><path d={waveformPath(clip)} /></svg>}<strong>{clip.name}</strong><small>{currentAssetLabel(clip)}</small>
+              {[...clip.transformKeys.map((key) => ({ ...key, kind: "transform" as const })), ...clip.volumeKeys.map((key) => ({ ...key, kind: "volume" as const })), ...Object.entries(clip.propertyCurves ?? {}).flatMap(([name,curve]) => curve.enabled ? curve.keys.map(key=>({...key,kind:`property:${name}` as `property:${PropertyName}`})) : [])].filter((key) => key.time >= clip.sourceIn && key.time <= clip.sourceIn + clip.duration * clip.rate).map((key) => <button key={key.id} className="seq-property-key" title={`${key.kind.startsWith("property:") ? propertyLabels[key.kind.slice(9) as PropertyName] : key.kind === "transform" ? "画面" : "音量"}关键帧 · ${key.time.toFixed(3)} 秒`} aria-label={`${key.kind.startsWith("property:") ? propertyLabels[key.kind.slice(9) as PropertyName] : key.kind === "transform" ? "画面" : "音量"}关键帧`} style={{ left: ((propertyKeyPreview?.clipId === clip.id && propertyKeyPreview.keyId === key.id ? propertyKeyPreview.time : key.time) - clip.sourceIn) / clip.rate * zoom }} onMouseDown={(event) => startPropertyKeyDrag(event, track.id, clip, key.kind, key.id)} onDoubleClick={(event) => event.stopPropagation()}>◆</button>)}
               <span className="seq-clip-grip right" onMouseDown={(event) => startClipDrag(event, track.id, clip, "right")} />
             </div>)}
             {dragPreview?.clips.filter((ghost) => ghost.trackId === track.id).map((ghost) => <div key={ghost.id} className={`seq-clip seq-clip-ghost${dragPreview.invalid ? " invalid" : ""}${dragPreview.createsTrack ? " new-track" : ""}`} style={{ left: ghost.start * zoom, width: Math.max(8, ghost.duration * zoom), backgroundColor: clipColor[ghost.kind] }}><strong>{ghost.name}</strong><small>{dragPreview.label}</small></div>)}

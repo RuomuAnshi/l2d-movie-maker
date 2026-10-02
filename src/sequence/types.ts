@@ -1,4 +1,5 @@
 import type { AnimationDocument } from "../animation/types";
+import type { Keyframe } from "../animation/types";
 
 export type AssetKind = "live2d" | "audio" | "image" | "text";
 
@@ -29,9 +30,13 @@ export type Transform = {
 };
 
 export type TransformKeyframe = Transform & { id: string; time: number };
+export type PropertyCurve = { enabled: boolean; keys: Keyframe[] };
+export type PropertyName = keyof Transform | "volume";
 
 export type Clip = {
   id: string;
+  /** Sequence-local association; linked clips retain their relative offsets. */
+  linkGroupId?: string;
   kind: AssetKind | "sequence";
   name: string;
   assetId?: string;
@@ -42,6 +47,7 @@ export type Clip = {
   rate: number;
   transform: Transform;
   transformKeys: TransformKeyframe[];
+  propertyCurves?: Partial<Record<PropertyName, PropertyCurve>>;
   volume: number;
   volumeKeys: Array<{ id: string; time: number; value: number }>;
   fadeIn: number;
@@ -49,6 +55,8 @@ export type Clip = {
   /** Original source range for fade phase preservation after a split or trim. */
   fadeRegion?: { sourceIn: number; sourceDuration: number; rate: number };
   lipSyncActorId?: string;
+  lipSyncOffset?: number;
+  preservePitch?: boolean;
   text?: string;
   fontFamily?: string;
   fontSize?: number;
@@ -155,12 +163,16 @@ export function createClip(input: Partial<Clip> & Pick<Clip, "kind" | "name" | "
     rate: input.rate ?? 1,
     transform: { ...DEFAULT_TRANSFORM, ...input.transform },
     transformKeys: input.transformKeys?.map((key) => ({ ...key })) ?? [],
+    propertyCurves: input.propertyCurves ? structuredClone(input.propertyCurves) : undefined,
     volume: input.volume ?? 1,
     volumeKeys: input.volumeKeys?.map((key) => ({ ...key })) ?? [],
     fadeIn: input.fadeIn ?? 0,
     fadeOut: input.fadeOut ?? 0,
     fadeRegion: input.fadeRegion ? { ...input.fadeRegion } : undefined,
     lipSyncActorId: input.lipSyncActorId,
+    lipSyncOffset: input.lipSyncOffset,
+    preservePitch: input.preservePitch ?? true,
+    linkGroupId: input.linkGroupId,
     text: input.text,
     fontFamily: input.fontFamily,
     fontSize: input.fontSize,

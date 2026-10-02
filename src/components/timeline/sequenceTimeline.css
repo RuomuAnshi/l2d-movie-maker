@@ -110,7 +110,8 @@
 .seq-clip-thumbnail { flex: 0 0 22px; width: 22px; height: 22px; object-fit: contain; pointer-events: none; }
 .seq-clip-waveform { position: absolute; inset: 2px 0; width: 100%; height: 20px; opacity: .4; pointer-events: none; }
 .seq-clip-waveform path { stroke: #fff6cd; stroke-width: .8; fill: none; }
-.seq-clip-grip { position: absolute; left: 0; top: 0; bottom: 0; width: 5px; background: #fff5cc44; cursor: ew-resize; z-index: 2; }
+.seq-clip-grip { position: absolute; left: 0; top: 0; bottom: 0; width: 8px; background: #fff5cc22; cursor: ew-resize; z-index: 2; }
+.seq-clip:hover .seq-clip-grip { background: #fff5cc77; }
 .seq-clip-grip.right { left: auto; right: 0; }
 .seq-property-key { position: absolute; bottom: -1px; width: 9px; height: 10px; padding: 0; border: 0; background: transparent; color: #fce09a; font-size: 8px; line-height: 10px; transform: translateX(-50%); cursor: ew-resize; z-index: 2; }
 .seq-tl-playhead { position: absolute; z-index: 2; top: 0; bottom: 0; width: 2px; background: #a84836; pointer-events: none; }
@@ -118,3 +119,14 @@
 .seq-tl-marquee { position: absolute; z-index: 7; border: 1px solid #887039; background: #f8db8044; pointer-events: none; box-sizing: border-box; }
 .seq-tl-empty { min-height: 34px; padding: 8px 6px; box-sizing: border-box; }
 .seq-tl-footer { justify-content: flex-start; gap: 12px; min-height: 19px; padding-block: 0; border-top: 1px solid var(--seq-line); border-bottom: 0; background: #ead9ad; color: #765e3d; font-size: 9px; }
+.seq-tl-tools select, .seq-tl-tools .seq-timecode { box-sizing: border-box; height: 21px; min-height: 21px; padding: 1px 4px; border: 1px solid #9d8054; border-radius: 2px; color: var(--seq-ink); background: #f4e6c0; font-size: 11px; }
+.seq-tl-tools .seq-timecode { width: 96px; font-variant-numeric: tabular-nums; text-align: center; }
+.seq-tl-tools :focus-visible { outline: 2px solid #547c3c; outline-offset: 1px; }
+.seq-tl-issue { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 3px 6px; background: #efd6ad; color: #843e29; font-size: 11px; }
+.seq-tl-issue button { border: 0; background: none; color: inherit; cursor: pointer; }
+.seq-tl-marked-range { position: absolute; top: 0; bottom: 0; background: #bb9c3644; border-inline: 2px solid #90712d; box-sizing: border-box; pointer-events: none; }
+.seq-clip-link { width: 12px; height: 12px; flex-shrink: 0; fill: none; stroke: currentColor; stroke-width: 1.5; pointer-events: none; }
+.seq-tl-track-controls button { position: relative; font-size: 10px; line-height: 13px; min-width: 16px; }
+.seq-tl-track-controls button::before { content: ""; position: absolute; inset: -2px 0; }
+.seq-tl-track-controls button:hover { background: #d6bd87; }
+.seq-tl-track-controls button:focus-visible { outline: 2px solid #566e3c; }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { materialSourceFromAsset, materialSourceToAsset, parseMaterialSource, type MaterialSource } from "../src/sequence/materials";
+import { materialSourceFromAsset, materialSourceToAsset, mergeMaterialAssets, parseMaterialSource, type MaterialSource } from "../src/sequence/materials";
 import { ModelAdapter } from "../src/animation/runtime";
 import { createEditSequence, type ProjectDocument } from "../src/sequence/types";
 import { isProjectDocument } from "../src/sequence/validation";
@@ -84,4 +84,11 @@ test("ModelAdapter materialReference synchronously resolves the actual source an
   globalThis.fetch = async (uri) => { assert.equal(uri, reference.uri); return { ok: true, text: async () => "source-A" } as Response; };
   try { assert.equal(await adapter.material("Idle", "motion"), "source-A"); }
   finally { globalThis.fetch = originalFetch; }
+});
+
+test("embedded library materials are deduplicated after bundle model relocation", () => {
+  const source={id:"old",kind:"motion" as const,name:"smile",sourceModel:"/old/model3.json",parts:[{partId:"0",uri:"",text:'{"Curves":[]}'}]};
+  const assets={old:materialSourceToAsset(source)};
+  assert.equal(mergeMaterialAssets(assets,[{...source,id:"relocated",sourceModel:"/new/model3.json"}]),assets);
+  assert.equal(Object.keys(mergeMaterialAssets(assets,[{...source,id:"modified",parts:[{partId:"0",uri:"",text:'{"Curves":[1]}'}]}])).length,2);
 });

@@ -2,6 +2,9 @@ import { createClip, createTrack, DEFAULT_TRANSFORM } from "./types";
 import type { Clip, ProjectDocument, ResolvedActor, ResolvedClip, Sequence, Track, Transform } from "./types";
 import { targetId, type AnimationDocument } from "../animation/types";
 
+import { cleanClipLinks, remapClipLinks } from "./links";
+import { propertyValue, transformProperties } from "./properties";
+
 const EPSILON = 1e-7;
 const visual = (clip: Clip) => clip.kind !== "audio";
 const endOf = (clip: Clip) => clip.start + clip.duration;
@@ -198,7 +201,7 @@ export function deleteClips(project: ProjectDocument, sequenceId: string, clipId
   const sequence = requireSequence(project, sequenceId);
   const ids = new Set(clipIds);
   for (const track of sequence.tracks) if (track.locked && track.clips.some((clip) => ids.has(clip.id))) throw new Error(`轨道“${track.name}”已锁定。`);
-  return setSequence(project, { ...sequence, tracks: sequence.tracks.map((track) => ({ ...track, clips: track.clips.filter((clip) => !ids.has(clip.id)) })) });
+  return setSequence(project, { ...sequence, tracks: cleanClipLinks(sequence.tracks.map((track) => ({ ...track, clips: track.clips.filter((clip) => !ids.has(clip.id)) }))) });
 }
 
 export function duplicateClips(project: ProjectDocument, sequenceId: string, clipIds: string[], timeOffset: number, fps = 30): ProjectDocument {
@@ -206,7 +209,8 @@ export function duplicateClips(project: ProjectDocument, sequenceId: string, cli
   const selected = sequence.tracks.flatMap((track) => track.clips.filter((clip) => clipIds.includes(clip.id)).map((clip) => ({ track, clip })));
   if (!selected.length) return project;
   const offset = Math.max(-Math.min(...selected.map(({ clip }) => clip.start)), snapFrame(timeOffset, fps));
-  return placeClipGroup(project, sequenceId, selected.map(({ track, clip }) => ({ order: track.order, clip: { ...clone(clip), id: crypto.randomUUID(), start: clip.start + offset, name: `${clip.name} 副本` } })));
+  const copied = remapClipLinks(selected.map(({ clip }) => clone(clip)));
+  return placeClipGroup(project, sequenceId, selected.map(({ track, clip }, index) => ({ order: track.order, clip: { ...copied[index], id: crypto.randomUUID(), start: clip.start + offset, name: `${clip.name} 副本` } })));
 }
 
 export function pasteClips(project: ProjectDocument, sequenceId: string, targetTrackId: string, targetTime: number, items: Array<{ trackOffset: number; timeOffset: number; clip: Clip }>, fps = 30): { project: ProjectDocument; clipIds: string[] } {
@@ -217,11 +221,12 @@ export function pasteClips(project: ProjectDocument, sequenceId: string, targetT
   const clipIds: string[] = [];
   const timeOrigin = Math.max(-Math.min(...items.map((item) => item.timeOffset)), snapFrame(targetTime, fps));
   const laneOrigin = Math.max(-Math.min(...items.map((item) => item.trackOffset)), target.order);
-  const placements = items.map((item) => {
+  const copied = remapClipLinks(items.map((item) => clone(item.clip)));
+  const placements = items.map((item, index) => {
     if (!Number.isInteger(item.trackOffset) || !Number.isFinite(item.timeOffset)) throw new Error("复制的片段位置无效。");
     const id = crypto.randomUUID();
     clipIds.push(id);
-    return { order: laneOrigin + item.trackOffset, clip: { ...clone(item.clip), id, start: timeOrigin + item.timeOffset, name: `${item.clip.name} 副本` } };
+    return { order: laneOrigin + item.trackOffset, clip: { ...copied[index], id, start: timeOrigin + item.timeOffset, name: `${item.clip.name} 副本` } };
   });
   return { project: placeClipGroup(project, sequenceId, placements), clipIds };
 }
@@ -287,7 +292,7 @@ export function createIndependentClip(project: ProjectDocument, sequenceId: stri
   for (const sequence of Object.values(copies)) for (const track of sequence.tracks) for (const clip of track.clips) {
     if (clip.lipSyncActorId && copiedActorIds[clip.lipSyncActorId]) clip.lipSyncActorId = copiedActorIds[clip.lipSyncActorId];
   }
-  const newClip = { ...clone(sourceClip), id: crypto.randomUUID(), name: `${sourceClip.name} 独立副本`, sequenceId: newSequenceId, start: endOf(sourceClip) };
+  const newClip = { ...clone(sourceClip), linkGroupId: undefined, id: crypto.randomUUID(), name: `${sourceClip.name} 独立副本`, sequenceId: newSequenceId, start: endOf(sourceClip) };
   const base = { ...project, sequences: { ...project.sequences, ...copies } };
   const inserted = insertClip(base, sequenceId, trackId, newClip);
   return { project: inserted.project, clipId: newClip.id, trackId: inserted.trackId };
@@ -311,13 +316,13 @@ export function createCompound(project: ProjectDocument, sequenceId: string, cli
   }
 
   const childId = crypto.randomUUID();
-  const childTracks: Track[] = parent.tracks.slice().sort((a, b) => a.order - b.order).filter((track) => selected.some((item) => item.track.id === track.id)).map((track, order) => ({
+  const childTracks: Track[] = cleanClipLinks(parent.tracks.slice().sort((a, b) => a.order - b.order).filter((track) => selected.some((item) => item.track.id === track.id)).map((track, order) => ({
     ...clone(track), id: crypto.randomUUID(), order, clips: track.clips.filter((clip) => selectedIds.has(clip.id)).map((clip) => ({ ...clone(clip), id: crypto.randomUUID(), start: clip.start - start })),
-  }));
+  })));
   const child: Sequence = { id: childId, name, kind: "edit", duration: end - start, width: parent.width, height: parent.height, fps: parent.fps, tracks: childTracks };
   const baseTrack = (selected.filter(({ clip }) => visual(clip)).length ? selected.filter(({ clip }) => visual(clip)) : selected).slice().sort((a, b) => a.track.order - b.track.order)[0].track;
   const comp = createClip({ kind: "sequence", sequenceId: childId, name, start, duration: end - start });
-  let base = setSequence(project, { ...parent, tracks: parent.tracks.map((track) => ({ ...track, clips: track.clips.filter((clip) => !selectedIds.has(clip.id)) })) });
+  let base = setSequence(project, { ...parent, tracks: cleanClipLinks(parent.tracks.map((track) => ({ ...track, clips: track.clips.filter((clip) => !selectedIds.has(clip.id)) }))) });
   base = { ...base, sequences: { ...base.sequences, [childId]: child } };
   let parentTrackId = baseTrack.id;
   if (baseTrack.hidden || baseTrack.muted) {
@@ -452,6 +457,10 @@ export function composeTransform(parent: Transform, child: Transform): Transform
 
 /** Clip property keys use source time, so trim and rate edits do not move the curve. */
 export function evaluateClipTransform(clip: Clip, sourceTime: number): Transform {
+  const legacy = evaluateLegacyTransform(clip, sourceTime);
+  return Object.fromEntries(transformProperties.map(name => [name, propertyValue(clip, name, sourceTime, legacy[name])])) as Transform;
+}
+function evaluateLegacyTransform(clip: Clip, sourceTime: number): Transform {
   const keys = clip.transformKeys.slice().sort((a, b) => a.time - b.time);
   if (!keys.length || sourceTime < keys[0].time) return { ...clip.transform };
   const rightIndex = keys.findIndex((key) => key.time > sourceTime);
@@ -463,7 +472,7 @@ export function evaluateClipTransform(clip: Clip, sourceTime: number): Transform
 }
 
 export function clipVolumeAt(clip: Clip, sourceTime: number): number {
-  return Math.max(0, sampleVolumeKeys(clip.volume, clip.volumeKeys, sourceTime));
+  return propertyValue(clip, "volume", sourceTime, Math.max(0, sampleVolumeKeys(clip.volume, clip.volumeKeys, sourceTime)));
 }
 
 export function sampleVolumeKeys(base: number, keys: Array<{ time: number; value: number }>, time: number): number {
@@ -485,7 +494,7 @@ export function remapAnimationCharacters(document: AnimationDocument, characterI
     return { ...clone(track), definition: { ...track.definition, characterId, target } };
   });
   const remapCurves = (curves: AnimationDocument["groups"][number]["curves"]) => Object.fromEntries(Object.entries(curves).map(([target, keys]) => [targets.get(target) ?? target, clone(keys)]));
-  return { ...clone(document), tracks, groups: document.groups.map((group) => ({ ...clone(group), curves: remapCurves(group.curves), originalCurves: group.originalCurves ? remapCurves(group.originalCurves) : undefined })) };
+  return { ...clone(document), tracks, groups: document.groups.map((group) => ({ ...clone(group), targetMask:group.targetMask?.map(target=>targets.get(target)??target), curves: remapCurves(group.curves), originalCurves: group.originalCurves ? remapCurves(group.originalCurves) : undefined })) };
 }
 
 function requireSequence(project: ProjectDocument, id: string): Sequence {

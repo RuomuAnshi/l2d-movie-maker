@@ -231,7 +231,11 @@ export function rebuildSources(document: AnimationDocument): AnimationDocument {
     return sourceBase ? { ...track, sourceBase, keys: sourceBase.keys, animated: sourceBase.animated } : track;
   }) };
   let next = base;
-  for (const group of document.groups) next = overlaySource(next, group);
+  for (const group of document.groups) {
+    if (group.enabled === false) continue;
+    const filtered = group.targetMask ? { ...group, curves: Object.fromEntries(Object.entries(group.curves).filter(([target]) => group.targetMask!.includes(target))) } : group;
+    next = overlaySource(next, filtered);
+  }
   return next;
 }
 export function insertSource(document: AnimationDocument, group: SourceGroup): AnimationDocument {
@@ -243,7 +247,7 @@ export function insertSource(document: AnimationDocument, group: SourceGroup): A
 export function editSource(
   document: AnimationDocument,
   id: string,
-  patch: Partial<Pick<SourceGroup, "start" | "duration" | "offset" | "speed">>,
+  patch: Partial<Pick<SourceGroup, "start" | "duration" | "offset" | "speed" | "enabled" | "targetMask">>,
 ) {
   if (!document.groups.some(g => g.id === id)) return document;
   return rebuildSources({ ...document, groups: document.groups.map(g => g.id === id ? { ...g, ...patch } : g) });
@@ -252,6 +256,14 @@ export function removeSource(document: AnimationDocument, id: string) {
   // Seed underlying tracks before removing a legacy group which has no sourceBase yet.
   const prepared = rebuildSources(document);
   return rebuildSources({ ...prepared, groups: prepared.groups.filter(g => g.id !== id) });
+}
+export function moveSourcePriority(document: AnimationDocument, id: string, delta: number): AnimationDocument {
+  const groups = document.groups.slice();
+  const index = groups.findIndex(group => group.id === id);
+  if (index < 0) return document;
+  const to = Math.max(0, Math.min(groups.length - 1, index + delta));
+  groups.splice(to, 0, groups.splice(index, 1)[0]);
+  return rebuildSources({ ...document, groups });
 }
 export class CommandHistory<T> {
   private past: T[] = [];
@@ -334,7 +346,7 @@ export function reconcileSourceEdits(
       if (!previous || !curves[track.definition.target]) continue;
       let keys = curves[track.definition.target];
       const newFrames = track.keys.filter(k => !k.sourceId && !previous.keys.some(old => old.id === k.id) &&
-        next.groups.slice().reverse().find(g => g.curves[track.definition.target]?.length && k.time >= g.start && k.time <= g.start + g.duration)?.id === group.id);
+        next.groups.slice().reverse().find(g => g.enabled!==false && (!g.targetMask||g.targetMask.includes(track.definition.target)) && g.curves[track.definition.target]?.length && k.time >= g.start && k.time <= g.start + g.duration)?.id === group.id);
       const frames = previous.keys.filter(k => k.sourceId === group.id && (!k.generated || (k.time >= group.start && k.time <= group.start + group.duration)));
       for (const old of [...frames, ...newFrames]) {
         let current = track.keys.find((k) => k.id === old.id);
